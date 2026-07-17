@@ -1,0 +1,51 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Datasets and downloaded/raw data
+data/
+dataset/
+datasets/
+raw_data/
+processed_data/
+*.h5
+*.hdf5
+*.npz
+*.npy
+
+# Model checkpoints and experiment artifacts
+checkpoints/
+checkpoint/
+ckpts/
+weights/
+models/
+runs/
+wandb/
+outputs/
+results/
+logs/
+*.ckpt
+*.pt
+*.pth
+*.pkl
+*.pickle
+
+# Notebook and editor state
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
