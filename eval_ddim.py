@@ -9,9 +9,9 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from sudoku_diffusion.checkpoint import load_ddim_unified
-from sudoku_diffusion.data import make_loader, to_device
-from sudoku_diffusion.metrics import exact_and_cell_accuracy, sudoku_violations
+from utils.sudoku.checkpoint import load_ddim_unified
+from utils.sudoku.data import make_loader, to_device
+from utils.sudoku.metrics import exact_and_cell_accuracy, sudoku_violations
 
 
 def parse_args() -> argparse.Namespace:

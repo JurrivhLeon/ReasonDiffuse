@@ -18,8 +18,8 @@ from reasoner_fm import (
     UnifiedLatentReasoner,
     VAEConfig,
 )
-from sudoku_diffusion.checkpoint import load_vae, save_json, save_unified, save_vae
-from sudoku_diffusion.data import (
+from utils.sudoku.checkpoint import load_vae, save_json, save_unified, save_vae
+from utils.sudoku.data import (
     iter_group_all_example_batches,
     iter_group_batches,
     iter_group_eval_batches,
@@ -27,7 +27,7 @@ from sudoku_diffusion.data import (
     split_group_ids,
     to_device,
 )
-from sudoku_diffusion.metrics import exact_and_cell_accuracy
+from utils.sudoku.metrics import exact_and_cell_accuracy
 
 
 def parse_args() -> argparse.Namespace:
@@ -219,7 +219,7 @@ def augmented_train_examples(
 ) -> int:
     if train_limit is not None:
         # In group mode, train_limit limits groups. Each Sudoku augmented puzzle has one row.
-        from sudoku_diffusion.data import SudokuArrays
+        from utils.sudoku.data import SudokuArrays
 
         arrays = SudokuArrays(data_dir, split="train")
         total = 0

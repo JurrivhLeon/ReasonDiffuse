@@ -26,7 +26,13 @@ class SudokuNpyDataset(Dataset):
     in 0..8 for cross entropy.
     """
 
-    def __init__(self, root: str | Path, split: str = "train", set_name: str = "all", limit: int | None = None):
+    def __init__(
+        self,
+        root: str | Path,
+        split: str = "train",
+        set_name: str = "all",
+        limit: int | None = None,
+    ):
         self.root = Path(root)
         self.split = split
         self.set_name = set_name
@@ -36,15 +42,23 @@ class SudokuNpyDataset(Dataset):
         self.inputs = np.load(split_dir / f"{set_name}__inputs.npy", mmap_mode="r")
         self.labels = np.load(split_dir / f"{set_name}__labels.npy", mmap_mode="r")
         if self.inputs.shape[1] != 81 or self.labels.shape[1] != 81:
-            raise ValueError(f"Expected Sudoku seq_len=81, got {self.inputs.shape}, {self.labels.shape}")
-        self.limit = min(limit, len(self.inputs)) if limit is not None else len(self.inputs)
+            raise ValueError(
+                f"Expected Sudoku seq_len=81, got {self.inputs.shape}, {self.labels.shape}"
+            )
+        self.limit = (
+            min(limit, len(self.inputs)) if limit is not None else len(self.inputs)
+        )
 
     def __len__(self) -> int:
         return self.limit
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        puzzle_trm = torch.from_numpy(np.asarray(self.inputs[idx], dtype=np.int64).copy())
-        label_trm = torch.from_numpy(np.asarray(self.labels[idx], dtype=np.int64).copy())
+        puzzle_trm = torch.from_numpy(
+            np.asarray(self.inputs[idx], dtype=np.int64).copy()
+        )
+        label_trm = torch.from_numpy(
+            np.asarray(self.labels[idx], dtype=np.int64).copy()
+        )
 
         # Embedding tokens: blank=0, givens 1..9.
         puzzle_tokens = (puzzle_trm - 1).clamp(min=0, max=9).long()
@@ -73,7 +87,9 @@ class SudokuArrays:
         self.puzzle_indices = np.load(split_dir / f"{set_name}__puzzle_indices.npy")
         self.group_indices = np.load(split_dir / f"{set_name}__group_indices.npy")
         if self.inputs.shape[1] != 81 or self.labels.shape[1] != 81:
-            raise ValueError(f"Expected Sudoku seq_len=81, got {self.inputs.shape}, {self.labels.shape}")
+            raise ValueError(
+                f"Expected Sudoku seq_len=81, got {self.inputs.shape}, {self.labels.shape}"
+            )
 
     @property
     def total_groups(self) -> int:
@@ -102,7 +118,9 @@ def split_group_ids(
     return train_ids, val_ids
 
 
-def _convert_rows(inputs: np.ndarray, labels: np.ndarray, indices: np.ndarray) -> dict[str, torch.Tensor]:
+def _convert_rows(
+    inputs: np.ndarray, labels: np.ndarray, indices: np.ndarray
+) -> dict[str, torch.Tensor]:
     puzzle_trm = torch.from_numpy(np.asarray(inputs[indices], dtype=np.int64).copy())
     label_trm = torch.from_numpy(np.asarray(labels[indices], dtype=np.int64).copy())
     puzzle_tokens = (puzzle_trm - 1).clamp(min=0, max=9).long()
@@ -147,7 +165,9 @@ def iter_group_batches(
             groups_seen += 1
             if len(pending) == batch_size:
                 epoch_done = groups_seen / total_groups
-                yield epoch_done, _convert_rows(arrays.inputs, arrays.labels, np.asarray(pending, dtype=np.int64))
+                yield epoch_done, _convert_rows(
+                    arrays.inputs, arrays.labels, np.asarray(pending, dtype=np.int64)
+                )
                 pending = []
 
 
@@ -169,11 +189,14 @@ def iter_group_eval_batches(
             puzzle_id = start_puzzle + offset
             indices.append(int(arrays.puzzle_indices[puzzle_id]))
             if len(indices) == batch_size:
-                yield _convert_rows(arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
+                yield _convert_rows(
+                    arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64)
+                )
                 indices = []
     if indices:
-        yield _convert_rows(arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
-
+        yield _convert_rows(
+            arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64)
+        )
 
 
 def iter_group_all_example_batches(
@@ -185,16 +208,24 @@ def iter_group_all_example_batches(
     arrays = SudokuArrays(data_dir, split=split)
     indices: list[int] = []
     for group_id in group_ids:
-        for puzzle_id in range(int(arrays.group_indices[group_id]), int(arrays.group_indices[group_id + 1])):
+        for puzzle_id in range(
+            int(arrays.group_indices[group_id]), int(arrays.group_indices[group_id + 1])
+        ):
             start = int(arrays.puzzle_indices[puzzle_id])
             end = int(arrays.puzzle_indices[puzzle_id + 1])
             for row_idx in range(start, end):
                 indices.append(row_idx)
                 if len(indices) == batch_size:
-                    yield _convert_rows(arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
+                    yield _convert_rows(
+                        arrays.inputs,
+                        arrays.labels,
+                        np.asarray(indices, dtype=np.int64),
+                    )
                     indices = []
     if indices:
-        yield _convert_rows(arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
+        yield _convert_rows(
+            arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64)
+        )
 
 
 def make_loader(
@@ -206,7 +237,13 @@ def make_loader(
     num_workers: int = 0,
 ) -> DataLoader:
     ds = SudokuNpyDataset(data_dir, split=split, limit=limit)
-    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
 
 
 def to_device(batch: dict[str, torch.Tensor], device: torch.device) -> SudokuBatch:
@@ -216,4 +253,3 @@ def to_device(batch: dict[str, torch.Tensor], device: torch.device) -> SudokuBat
         solution_classes=batch["solution_classes"].to(device, non_blocking=True),
         solution_digits=batch["solution_digits"].to(device, non_blocking=True),
     )
-

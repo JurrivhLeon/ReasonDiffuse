@@ -7,9 +7,9 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from sudoku_diffusion.checkpoint import save_vae
-from sudoku_diffusion.data import make_loader, to_device
-from sudoku_diffusion.metrics import exact_and_cell_accuracy
+from utils.sudoku.checkpoint import save_vae
+from utils.sudoku.data import make_loader, to_device
+from utils.sudoku.metrics import exact_and_cell_accuracy
 from reasoner_fm import SudokuVAE, VAEConfig
 
 

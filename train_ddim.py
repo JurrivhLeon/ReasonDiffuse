@@ -15,14 +15,14 @@ from reasoner_ddim import (
     LatentDDIMReasoner,
     UnifiedDDIMLatentReasoner,
 )
-from sudoku_diffusion.checkpoint import load_vae, save_ddim_unified, save_vae
-from sudoku_diffusion.data import (
+from utils.sudoku.checkpoint import load_vae, save_ddim_unified, save_vae
+from utils.sudoku.data import (
     iter_group_batches,
     iter_group_eval_batches,
     split_group_ids,
     to_device,
 )
-from sudoku_diffusion.metrics import exact_and_cell_accuracy
+from utils.sudoku.metrics import exact_and_cell_accuracy
 from train_fm import (
     best_path,
     compute_latent_stats,

@@ -15,9 +15,9 @@ from reasoner_ddim import (
     LatentDDIMReasoner,
     UnifiedDDIMLatentReasoner,
 )
-from sudoku_diffusion.checkpoint import load_ddim_unified, save_ddim_unified
-from sudoku_diffusion.data import SudokuNpyDataset
-from sudoku_diffusion.metrics import exact_and_cell_accuracy, sudoku_violations
+from utils.sudoku.checkpoint import load_ddim_unified, save_ddim_unified
+from utils.sudoku.data import SudokuNpyDataset
+from utils.sudoku.metrics import exact_and_cell_accuracy, sudoku_violations
 from reasoner_fm import (
     LatentFlowReasoner,
     ReasonerConfig,

@@ -10,9 +10,9 @@ import torch
 from tqdm import tqdm
 import torch.nn.functional as F
 
-from sudoku_diffusion.checkpoint import load_vae, save_unified
-from sudoku_diffusion.data import make_loader, to_device
-from sudoku_diffusion.metrics import exact_and_cell_accuracy
+from utils.sudoku.checkpoint import load_vae, save_unified
+from utils.sudoku.data import make_loader, to_device
+from utils.sudoku.metrics import exact_and_cell_accuracy
 from reasoner_fm import LatentFlowReasoner, ReasonerConfig, UnifiedLatentReasoner
 
 

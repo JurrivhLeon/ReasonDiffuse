@@ -3,7 +3,9 @@ from __future__ import annotations
 import torch
 
 
-def exact_and_cell_accuracy(pred_digits: torch.Tensor, target_digits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def exact_and_cell_accuracy(
+    pred_digits: torch.Tensor, target_digits: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     correct = pred_digits.eq(target_digits)
     cell = correct.float().mean()
     exact = correct.all(dim=1).float().mean()
@@ -22,7 +24,8 @@ def sudoku_violations(pred_digits: torch.Tensor) -> torch.Tensor:
 
     violations = torch.zeros(boards.shape[0], device=pred_digits.device)
     for unit in all_units:
-        counts = torch.stack([(unit == digit).sum(dim=1) for digit in range(1, 10)], dim=1)
+        counts = torch.stack(
+            [(unit == digit).sum(dim=1) for digit in range(1, 10)], dim=1
+        )
         violations = violations + (counts - 1).abs().sum(dim=1)
     return violations
-

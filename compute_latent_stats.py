@@ -6,8 +6,8 @@ from pathlib import Path
 
 import torch
 
-from sudoku_diffusion.checkpoint import load_vae
-from sudoku_diffusion.data import make_loader, to_device
+from utils.sudoku.checkpoint import load_vae
+from utils.sudoku.data import make_loader, to_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +26,9 @@ def main() -> None:
     device = torch.device(args.device)
     vae, _ = load_vae(args.vae, device)
     vae.eval()
-    loader = make_loader(args.data_dir, "train", args.batch_size, shuffle=False, limit=args.limit)
+    loader = make_loader(
+        args.data_dir, "train", args.batch_size, shuffle=False, limit=args.limit
+    )
 
     count = 0
     total = None
@@ -37,7 +39,11 @@ def main() -> None:
             mu, _ = vae.encode(batch.puzzle_tokens, batch.solution_classes)
             flat = mu.reshape(-1, mu.shape[-1]).float()
             total = flat.sum(dim=0) if total is None else total + flat.sum(dim=0)
-            total_sq = (flat * flat).sum(dim=0) if total_sq is None else total_sq + (flat * flat).sum(dim=0)
+            total_sq = (
+                (flat * flat).sum(dim=0)
+                if total_sq is None
+                else total_sq + (flat * flat).sum(dim=0)
+            )
             count += flat.shape[0]
 
     mean = total / count
@@ -45,7 +51,9 @@ def main() -> None:
     std = var.sqrt()
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     torch.save({"mean": mean.cpu(), "std": std.cpu(), "count": count}, args.out)
-    print(f"saved {args.out} count={count} mean_abs={mean.abs().mean().item():.4f} std_mean={std.mean().item():.4f}")
+    print(
+        f"saved {args.out} count={count} mean_abs={mean.abs().mean().item():.4f} std_mean={std.mean().item():.4f}"
+    )
 
 
 if __name__ == "__main__":
