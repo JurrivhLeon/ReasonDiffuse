@@ -5,12 +5,26 @@ import sys
 from pathlib import Path
 
 import torch
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from reasoner_ddim import (
+    DDIMReasonerConfig,
+    DDIMScheduleConfig,
+    LatentDDIMReasoner,
+    UnifiedDDIMLatentReasoner,
+)
+from sudoku_diffusion.checkpoint import load_ddim_unified, save_ddim_unified
 from sudoku_diffusion.data import SudokuNpyDataset
 from sudoku_diffusion.metrics import exact_and_cell_accuracy, sudoku_violations
-from diffusion_reasoning_model import LatentFlowReasoner, ReasonerConfig, SudokuVAE, UnifiedLatentReasoner, VAEConfig
+from reasoner_fm import (
+    LatentFlowReasoner,
+    ReasonerConfig,
+    SudokuVAE,
+    UnifiedLatentReasoner,
+    VAEConfig,
+)
 
 
 def main() -> None:
@@ -50,6 +64,33 @@ def main() -> None:
     sampled, q = unified.sample(puzzle, r_steps=1, k_samples=2)
     assert sampled.shape == (4, 81)
     assert q.shape == (4,)
+
+    ddim_reasoner = LatentDDIMReasoner(
+        DDIMReasonerConfig(d_model=32, d_z=16, layers=1, heads=4)
+    )
+    ddim_unified = UnifiedDDIMLatentReasoner(
+        vae,
+        ddim_reasoner,
+        schedule=DDIMScheduleConfig(train_timesteps=10),
+    )
+    ddim_unified.set_latent_stats(torch.zeros(16), torch.ones(16))
+    t_idx = torch.randint(1, ddim_unified.train_timesteps + 1, (4,))
+    z_star = torch.randn(4, 81, 16)
+    z_t, _ = ddim_unified.q_sample(z_star, t_idx)
+    ddim_out = ddim_unified.reasoner_step(z_t, puzzle, t_idx)
+    assert ddim_out["x0_pred"].shape == (4, 81, 16)
+    assert ddim_out["q_logits"].shape == (4,)
+    ddim_sampled, ddim_q = ddim_unified.sample(puzzle, r_steps=2, k_samples=2)
+    assert ddim_sampled.shape == (4, 81)
+    assert ddim_q.shape == (4,)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "ddim.pt"
+        save_ddim_unified(path, ddim_unified, {"test": True})
+        loaded, ckpt = load_ddim_unified(path, torch.device("cpu"))
+        assert ckpt["test"] is True
+        loaded_sampled, loaded_q = loaded.sample(puzzle, r_steps=1, k_samples=1)
+        assert loaded_sampled.shape == (4, 81)
+        assert loaded_q.shape == (4,)
 
     pred = target_digits.clone()
     exact, cell = exact_and_cell_accuracy(pred, target_digits)

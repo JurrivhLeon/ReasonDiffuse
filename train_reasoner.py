@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from sudoku_diffusion.checkpoint import load_vae, save_unified
 from sudoku_diffusion.data import make_loader, to_device
 from sudoku_diffusion.metrics import exact_and_cell_accuracy
-from diffusion_reasoning_model import LatentFlowReasoner, ReasonerConfig, UnifiedLatentReasoner
+from reasoner_fm import LatentFlowReasoner, ReasonerConfig, UnifiedLatentReasoner
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,8 +23,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stats", default="checkpoints/sudoku_latent_stats.pt")
     p.add_argument("--out", default="checkpoints/sudoku_reasoner.pt")
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--steps", type=int, default=None, help="Optimizer steps. Overrides --epochs if set.")
-    p.add_argument("--epochs", type=int, default=60000, help="TRM-style group epochs by default")
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=None,
+        help="Optimizer steps. Overrides --epochs if set.",
+    )
+    p.add_argument(
+        "--epochs", type=int, default=60000, help="TRM-style group epochs by default"
+    )
     p.add_argument("--epoch-unit", choices=("groups", "examples"), default="groups")
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--warmup-steps", type=int, default=2000)
@@ -74,12 +81,25 @@ def main() -> None:
     reasoner = LatentFlowReasoner(cfg).to(device)
     model = UnifiedLatentReasoner(vae, reasoner).to(device)
     model.set_latent_stats(stats["mean"], stats["std"])
-    opt = torch.optim.AdamW(model.reasoner.parameters(), lr=args.lr, betas=(args.beta1, args.beta2), weight_decay=args.weight_decay)
-    loader = make_loader(args.data_dir, "train", args.batch_size, shuffle=True, limit=args.train_limit)
+    opt = torch.optim.AdamW(
+        model.reasoner.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+    )
+    loader = make_loader(
+        args.data_dir, "train", args.batch_size, shuffle=True, limit=args.train_limit
+    )
     it = iter(loader)
     epoch_size = _epoch_size(args.data_dir, args.epoch_unit, args.train_limit)
-    total_steps = args.steps if args.steps is not None else math.ceil(args.epochs * epoch_size / args.batch_size)
-    print(f"training reasoner for total_steps={total_steps} epochs={args.epochs} epoch_unit={args.epoch_unit} epoch_size={epoch_size}")
+    total_steps = (
+        args.steps
+        if args.steps is not None
+        else math.ceil(args.epochs * epoch_size / args.batch_size)
+    )
+    print(
+        f"training reasoner for total_steps={total_steps} epochs={args.epochs} epoch_unit={args.epoch_unit} epoch_size={epoch_size}"
+    )
 
     model.train()
     model.vae.eval()
@@ -92,7 +112,9 @@ def main() -> None:
             raw = next(it)
         batch = to_device(raw, device)
         with torch.no_grad():
-            z_star = model.encode_solution_normalized(batch.puzzle_tokens, batch.solution_classes)
+            z_star = model.encode_solution_normalized(
+                batch.puzzle_tokens, batch.solution_classes
+            )
 
         eps = torch.randn_like(z_star)
         tau = torch.rand(z_star.shape[0], device=device)
@@ -103,18 +125,26 @@ def main() -> None:
 
         z_pred = z_tau - tau[:, None, None] * out["velocity"]
         logits = model.decode_normalized(batch.puzzle_tokens, z_pred)
-        answer_loss = F.cross_entropy(logits.reshape(-1, 9), batch.solution_classes.reshape(-1))
+        answer_loss = F.cross_entropy(
+            logits.reshape(-1, 9), batch.solution_classes.reshape(-1)
+        )
 
         with torch.no_grad():
             pred_digits = logits.argmax(dim=-1) + 1
             q_target = pred_digits.eq(batch.solution_digits).all(dim=1).float()
         q_loss = F.binary_cross_entropy_with_logits(out["q_logits"], q_target)
 
-        loss = cfg.lambda_fm * fm_loss + cfg.lambda_answer * answer_loss + cfg.lambda_q * q_loss
+        loss = (
+            cfg.lambda_fm * fm_loss
+            + cfg.lambda_answer * answer_loss
+            + cfg.lambda_q * q_loss
+        )
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.reasoner.parameters(), 1.0)
-        lr_scale = min(1.0, step / max(1, args.warmup_steps)) if args.warmup_steps > 0 else 1.0
+        lr_scale = (
+            min(1.0, step / max(1, args.warmup_steps)) if args.warmup_steps > 0 else 1.0
+        )
         for group in opt.param_groups:
             group["lr"] = args.lr * lr_scale
         opt.step()
@@ -136,10 +166,19 @@ def main() -> None:
                 f"ce={answer_loss.item():.4f} q={q_loss.item():.4f} exact={exact.item():.4f} cell={cell.item():.4f}"
             )
 
-    save_unified(args.out, model, {"steps": total_steps, "epochs": args.epochs, "epoch_unit": args.epoch_unit, "vae": args.vae, "stats": args.stats})
+    save_unified(
+        args.out,
+        model,
+        {
+            "steps": total_steps,
+            "epochs": args.epochs,
+            "epoch_unit": args.epoch_unit,
+            "vae": args.vae,
+            "stats": args.stats,
+        },
+    )
     print(f"saved {Path(args.out)}")
 
 
 if __name__ == "__main__":
     main()
-

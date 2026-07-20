@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from diffusion_reasoning_model import (
+from reasoner_fm import (
     LatentFlowReasoner,
     ReasonerConfig,
     SudokuVAE,

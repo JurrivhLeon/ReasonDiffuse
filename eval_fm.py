@@ -78,7 +78,7 @@ def main() -> None:
     else:
         vae, _ = load_vae(args.vae, device)
         reasoner, _ = load_reasoner(args.reasoner, device)
-        from diffusion_reasoning_model import UnifiedLatentReasoner
+        from reasoner_fm import UnifiedLatentReasoner
 
         model = UnifiedLatentReasoner(vae, reasoner).to(device)
         stats = torch.load(args.stats, map_location=device)

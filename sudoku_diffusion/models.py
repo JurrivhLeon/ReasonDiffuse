@@ -1,6 +1,6 @@
 """Compatibility re-export for the root-level model module."""
 
-from diffusion_reasoning_model import (  # noqa: F401
+from reasoner_fm import (  # noqa: F401
     LatentFlowReasoner,
     ReasonerConfig,
     RotarySelfAttention,

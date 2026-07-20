@@ -14,7 +14,7 @@
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Latent Workspace}{2}{subsection.4.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Conditional Denoising Transition}{3}{subsection.4.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Decoder}{3}{subsection.4.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {5}Architecture Details}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Architecture Details}{4}{section.5}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Tokenization and Embeddings}{4}{subsection.5.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Conditional VAE Architecture}{4}{subsection.5.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Latent Normalization}{5}{subsection.5.3}\protected@file@percent }
@@ -22,37 +22,42 @@
 \@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Q-Head Architecture}{6}{subsection.5.5}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {6}Training Objectives}{6}{section.6}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Stage 1: Conditional VAE for Solution States}{6}{subsection.6.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Stage 2: Joint Reasoner and Q-Head Training}{6}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Stage 2: Joint Reasoner and Q-Head Training}{7}{subsection.6.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Final answer loss.}{7}{section*.6}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{Flow matching loss.}{7}{section*.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Noise-prediction version.}{7}{section*.8}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Rollout Training}{7}{subsection.6.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Practical schedule.}{8}{section*.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Intermediate Decoding Loss (Optional)}{8}{subsection.6.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Joint Q-Head Loss}{9}{subsection.6.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.6}Utility of the Q Head}{9}{subsection.6.6}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Primary role: sample selection.}{9}{section*.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Optional role: inference-time early stopping.}{9}{section*.11}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Training-time early stopping.}{9}{section*.12}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {6.7}Total Stage-2 Objective}{10}{subsection.6.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {7}Inference}{10}{section.7}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {8}First Experimental Plan}{10}{section.8}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Start with Sudoku}{10}{subsection.8.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Initial architecture.}{10}{section*.13}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Training setup.}{11}{section*.14}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Baselines.}{11}{section*.15}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Metrics.}{11}{section*.16}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Sudoku Implementation Details}{11}{subsection.8.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Input and output representation.}{12}{section*.17}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Decoder and logits.}{12}{section*.18}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Training loss.}{12}{section*.19}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Exact accuracy.}{12}{section*.20}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Constraint diagnostics.}{13}{section*.21}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Multi-sample inference.}{13}{section*.22}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Then Maze}{13}{subsection.8.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Then ARC-Style Grids}{13}{subsection.8.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {9}Key Research Questions}{13}{section.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {10}Main Risks}{14}{section.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Mitigations.}{14}{section*.23}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Mitigations.}{14}{section*.24}\protected@file@percent }
-\gdef \@abspage@last{14}
+\@writefile{toc}{\contentsline {paragraph}{DDPM/DDIM denoising variant.}{8}{section*.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Rollout Training}{8}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Practical schedule.}{9}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.4}Intermediate Decoding Loss (Optional)}{9}{subsection.6.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.5}Joint Q-Head Loss}{10}{subsection.6.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.6}Utility of the Q Head}{10}{subsection.6.6}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Primary role: sample selection.}{10}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Optional role: inference-time early stopping.}{10}{section*.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Training-time early stopping.}{10}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.7}Total Stage-2 Objective}{11}{subsection.6.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Inference}{11}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}First Experimental Plan}{11}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.1}Start with Sudoku}{11}{subsection.8.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Initial architecture.}{11}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Training setup.}{12}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Baselines.}{12}{section*.15}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Metrics.}{13}{section*.16}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.2}Sudoku Implementation Details}{13}{subsection.8.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Input and output representation.}{13}{section*.17}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Decoder and logits.}{13}{section*.18}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Training loss.}{14}{section*.19}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Exact accuracy.}{14}{section*.20}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Constraint diagnostics.}{14}{section*.21}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Multi-sample inference.}{14}{section*.22}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.3}Then Maze}{15}{subsection.8.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What should transfer from Sudoku.}{15}{section*.23}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{What must change.}{15}{section*.24}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Recommended Maze VAE target.}{15}{section*.25}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Maze losses and metrics.}{15}{section*.26}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Implementation implication.}{16}{section*.27}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {8.4}Then ARC-Style Grids}{16}{subsection.8.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Key Research Questions}{16}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Main Risks}{16}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Mitigations.}{16}{section*.28}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Mitigations.}{17}{section*.29}\protected@file@percent }
+\gdef \@abspage@last{17}
