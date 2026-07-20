@@ -26,6 +26,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=512)
     p.add_argument("--R", type=int, default=8)
     p.add_argument("--K", type=int, default=1)
+    p.add_argument(
+        "--cycles", type=int, default=1, help="Number of test-time diffusion cycles"
+    )
+    p.add_argument(
+        "--cycle-tau-start",
+        type=float,
+        default=0.25,
+        help="Tau start for refinement cycles after the first full denoising cycle",
+    )
+    p.add_argument(
+        "--cycle-noise",
+        type=float,
+        default=0.25,
+        help="Interpolation noise alpha for refinement cycles: z=(1-alpha)z+alpha*eps",
+    )
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument(
         "--output",
@@ -37,9 +52,22 @@ def parse_args() -> argparse.Namespace:
 
 @torch.inference_mode()
 def sample_batch(
-    model, puzzle_tokens: torch.Tensor, r_steps: int, k_samples: int
+    model,
+    puzzle_tokens: torch.Tensor,
+    r_steps: int,
+    k_samples: int,
+    cycles: int,
+    cycle_tau_start: float,
+    cycle_noise: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return model.sample(puzzle_tokens, r_steps=r_steps, k_samples=k_samples)
+    return model.sample(
+        puzzle_tokens,
+        r_steps=r_steps,
+        k_samples=k_samples,
+        cycles=cycles,
+        cycle_tau_start=cycle_tau_start,
+        cycle_noise=cycle_noise,
+    )
 
 
 def main() -> None:
@@ -69,7 +97,15 @@ def main() -> None:
     progress = tqdm(loader, desc="eval", total=len(loader), unit="batch")
     for raw in progress:
         batch = to_device(raw, device)
-        pred, q = sample_batch(model, batch.puzzle_tokens, args.R, args.K)
+        pred, q = sample_batch(
+            model,
+            batch.puzzle_tokens,
+            args.R,
+            args.K,
+            args.cycles,
+            args.cycle_tau_start,
+            args.cycle_noise,
+        )
         exact, cell = exact_and_cell_accuracy(pred, batch.solution_digits)
         violations = sudoku_violations(pred)
         bsz = pred.shape[0]
@@ -95,7 +131,8 @@ def main() -> None:
     }
     print(
         f"n={n} exact={metrics['exact']:.4f} cell={metrics['cell']:.4f} "
-        f"violations={metrics['violations']:.4f} q_mean={metrics['q_mean']:.4f} R={args.R} K={args.K}"
+        f"violations={metrics['violations']:.4f} q_mean={metrics['q_mean']:.4f} "
+        f"R={args.R} K={args.K} cycles={args.cycles} cycle_tau_start={args.cycle_tau_start} cycle_noise={args.cycle_noise}"
     )
 
     output = args.output

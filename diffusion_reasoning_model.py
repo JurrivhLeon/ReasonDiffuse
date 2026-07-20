@@ -293,6 +293,7 @@ class UnifiedLatentReasoner(nn.Module):
         r_steps: int = 8,
         noise: torch.Tensor | None = None,
         return_intermediates: bool = False,
+        tau_start: float = 1.0,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
         z = (
             noise
@@ -301,11 +302,15 @@ class UnifiedLatentReasoner(nn.Module):
                 puzzle_tokens.shape[0], 81, self.d_z, device=puzzle_tokens.device
             )
         )
-        step_size = 1.0 / max(r_steps, 1)
+        tau_start = float(tau_start)
+        step_size = tau_start / max(r_steps, 1)
         intermediate_logits = []
         for i in range(r_steps):
             tau = torch.full(
-                (z.shape[0],), 1.0 - i * step_size, device=z.device, dtype=z.dtype
+                (z.shape[0],),
+                tau_start - i * step_size,
+                device=z.device,
+                dtype=z.dtype,
             )
             out = self.reasoner_step(z, puzzle_tokens, tau)
             z = z - step_size * out["velocity"]
@@ -326,11 +331,27 @@ class UnifiedLatentReasoner(nn.Module):
 
     @torch.inference_mode()
     def sample(
-        self, puzzle_tokens: torch.Tensor, r_steps: int = 8, k_samples: int = 1
+        self,
+        puzzle_tokens: torch.Tensor,
+        r_steps: int = 8,
+        k_samples: int = 1,
+        cycles: int = 1,
+        cycle_tau_start: float = 0.25,
+        cycle_noise: float = 0.25,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = puzzle_tokens.shape[0]
         puzzle_rep = puzzle_tokens.repeat_interleave(k_samples, dim=0)
-        out = self.rollout(puzzle_rep, r_steps=r_steps)
+        z = torch.randn(bsz * k_samples, 81, self.d_z, device=puzzle_tokens.device)
+        out = self.rollout(puzzle_rep, r_steps=r_steps, noise=z, tau_start=1.0)
+        z = out["z"]
+        for _ in range(max(int(cycles), 1) - 1):
+            eps = torch.randn_like(z)
+            alpha = float(cycle_noise)
+            z = (1.0 - alpha) * z + alpha * eps
+            out = self.rollout(
+                puzzle_rep, r_steps=r_steps, noise=z, tau_start=cycle_tau_start
+            )
+            z = out["z"]
         logits = out["logits"]
         pred = logits.argmax(dim=-1) + 1
         q = out["q_logits"]

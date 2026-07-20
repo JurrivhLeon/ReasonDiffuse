@@ -23,6 +23,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--R", type=int, default=8)
     p.add_argument("--K", type=int, default=1)
+    p.add_argument("--cycles", type=int, default=1)
+    p.add_argument("--cycle-tau-start", type=float, default=0.25)
+    p.add_argument("--cycle-noise", type=float, default=0.25)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     return p.parse_args()
 
@@ -44,11 +47,18 @@ def board_text(values: torch.Tensor) -> str:
     return "\n".join(lines)
 
 
-def render_board_html(title: str, values: torch.Tensor, target: torch.Tensor | None = None, givens: torch.Tensor | None = None) -> str:
+def render_board_html(
+    title: str,
+    values: torch.Tensor,
+    target: torch.Tensor | None = None,
+    givens: torch.Tensor | None = None,
+) -> str:
     rows = board_rows(values)
     target_rows = board_rows(target) if target is not None else None
     given_rows = board_rows(givens) if givens is not None else None
-    out = [f"<div class='board-block'><div class='board-title'>{html.escape(title)}</div><table class='sudoku'>"]
+    out = [
+        f"<div class='board-block'><div class='board-title'>{html.escape(title)}</div><table class='sudoku'>"
+    ]
     for r, row in enumerate(rows):
         out.append("<tr>")
         for c, value in enumerate(row):
@@ -75,16 +85,37 @@ def main() -> None:
     model, _ = load_unified(args.model, device)
     model.eval()
 
-    loader = make_loader(args.data_dir, args.split, args.batch_size, shuffle=False, limit=max(args.num_samples, args.batch_size))
+    loader = make_loader(
+        args.data_dir,
+        args.split,
+        args.batch_size,
+        shuffle=False,
+        limit=max(args.num_samples, args.batch_size),
+    )
     raw = next(iter(loader))
     batch = to_device(raw, device)
-    pred, q = model.sample(batch.puzzle_tokens, r_steps=args.R, k_samples=args.K)
+    pred, q = model.sample(
+        batch.puzzle_tokens,
+        r_steps=args.R,
+        k_samples=args.K,
+        cycles=args.cycles,
+        cycle_tau_start=args.cycle_tau_start,
+        cycle_noise=args.cycle_noise,
+    )
     violations = sudoku_violations(pred)
 
     n = min(args.num_samples, pred.shape[0])
     out_stem = Path(args.model).with_suffix("")
-    out_html = Path(args.out_html) if args.out_html is not None else out_stem.parent / f"{out_stem.name}_samples.html"
-    out_txt = Path(args.out_txt) if args.out_txt is not None else out_stem.parent / f"{out_stem.name}_samples.txt"
+    out_html = (
+        Path(args.out_html)
+        if args.out_html is not None
+        else out_stem.parent / f"{out_stem.name}_samples.html"
+    )
+    out_txt = (
+        Path(args.out_txt)
+        if args.out_txt is not None
+        else out_stem.parent / f"{out_stem.name}_samples.txt"
+    )
     out_html.parent.mkdir(parents=True, exist_ok=True)
     out_txt.parent.mkdir(parents=True, exist_ok=True)
 
@@ -122,11 +153,15 @@ def main() -> None:
             f"prediction:\n{board_text(prediction)}\n"
         )
         html_parts.append("<div class='sample'>")
-        html_parts.append(f"<div class='meta'>sample {i} correct={correct} cell_acc={cell_acc:.4f} violations={vio} q={q_score:.4f}</div>")
+        html_parts.append(
+            f"<div class='meta'>sample {i} correct={correct} cell_acc={cell_acc:.4f} violations={vio} q={q_score:.4f}</div>"
+        )
         html_parts.append("<div class='boards'>")
         html_parts.append(render_board_html("Puzzle", puzzle))
         html_parts.append(render_board_html("Target", target, givens=puzzle))
-        html_parts.append(render_board_html("Prediction", prediction, target=target, givens=puzzle))
+        html_parts.append(
+            render_board_html("Prediction", prediction, target=target, givens=puzzle)
+        )
         html_parts.append("</div></div>")
 
     html_parts.append("</body></html>")
