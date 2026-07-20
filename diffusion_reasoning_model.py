@@ -32,7 +32,9 @@ class ReasonerConfig:
 
 def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     half = dim // 2
-    freqs = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device) / max(half - 1, 1))
+    freqs = torch.exp(
+        -math.log(10000.0) * torch.arange(half, device=t.device) / max(half - 1, 1)
+    )
     args = t[:, None] * freqs[None, :]
     emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
     if dim % 2:
@@ -41,7 +43,9 @@ def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class RotarySelfAttention(nn.Module):
-    def __init__(self, d_model: int, heads: int, dropout: float = 0.0, seq_len: int = 81):
+    def __init__(
+        self, d_model: int, heads: int, dropout: float = 0.0, seq_len: int = 81
+    ):
         super().__init__()
         if d_model % heads != 0:
             raise ValueError("d_model must be divisible by heads")
@@ -50,7 +54,9 @@ class RotarySelfAttention(nn.Module):
         self.qkv = nn.Linear(d_model, 3 * d_model)
         self.out = nn.Linear(d_model, d_model)
         self.dropout = dropout
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+        inv_freq = 1.0 / (
+            10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)
+        )
         positions = torch.arange(seq_len).float()
         freqs = torch.einsum("i,j->ij", positions, inv_freq)
         self.register_buffer("cos", freqs.cos(), persistent=False)
@@ -63,16 +69,24 @@ class RotarySelfAttention(nn.Module):
         cos = self.cos[: x.shape[2], : x_pair.shape[-2]][None, None, :, :]
         sin = self.sin[: x.shape[2], : x_pair.shape[-2]][None, None, :, :]
         x0, x1 = x_pair[..., 0], x_pair[..., 1]
-        rotated = torch.stack([x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1).flatten(-2)
+        rotated = torch.stack(
+            [x0 * cos - x1 * sin, x0 * sin + x1 * cos], dim=-1
+        ).flatten(-2)
         return torch.cat([rotated, x_pass], dim=-1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         bsz, seq_len, d_model = x.shape
-        qkv = self.qkv(x).view(bsz, seq_len, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = (
+            self.qkv(x)
+            .view(bsz, seq_len, 3, self.heads, self.head_dim)
+            .permute(2, 0, 3, 1, 4)
+        )
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = self._rope(q)
         k = self._rope(k)
-        y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0)
+        y = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.dropout if self.training else 0.0
+        )
         y = y.transpose(1, 2).reshape(bsz, seq_len, d_model)
         return self.out(y)
 
@@ -100,7 +114,9 @@ class TransformerBlock(nn.Module):
 class TransformerStack(nn.Module):
     def __init__(self, layers: int, d_model: int, heads: int, dropout: float = 0.0):
         super().__init__()
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, heads, dropout) for _ in range(layers)])
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(d_model, heads, dropout) for _ in range(layers)]
+        )
         self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -115,13 +131,19 @@ class SudokuVAE(nn.Module):
         self.config = config
         self.puzzle_emb = nn.Embedding(10, config.d_model)
         self.solution_emb = nn.Embedding(9, config.d_model)
-        self.encoder = TransformerStack(config.layers, config.d_model, config.heads, config.dropout)
+        self.encoder = TransformerStack(
+            config.layers, config.d_model, config.heads, config.dropout
+        )
         self.to_mu_logvar = nn.Linear(config.d_model, 2 * config.d_z)
         self.z_proj = nn.Linear(config.d_z, config.d_model)
-        self.decoder = TransformerStack(config.layers, config.d_model, config.heads, config.dropout)
+        self.decoder = TransformerStack(
+            config.layers, config.d_model, config.heads, config.dropout
+        )
         self.out = nn.Linear(config.d_model, 9)
 
-    def encode(self, puzzle_tokens: torch.Tensor, solution_classes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self, puzzle_tokens: torch.Tensor, solution_classes: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.puzzle_emb(puzzle_tokens) + self.solution_emb(solution_classes)
         h = self.encoder(h)
         mu, logvar = self.to_mu_logvar(h).chunk(2, dim=-1)
@@ -137,13 +159,23 @@ class SudokuVAE(nn.Module):
         h = self.decoder(h)
         return self.out(h)
 
-    def forward(self, puzzle_tokens: torch.Tensor, solution_classes: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self, puzzle_tokens: torch.Tensor, solution_classes: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
         mu, logvar = self.encode(puzzle_tokens, solution_classes)
         z = self.sample(mu, logvar)
         logits = self.decode(puzzle_tokens, z)
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
         recon = F.cross_entropy(logits.reshape(-1, 9), solution_classes.reshape(-1))
-        return {"logits": logits, "z": z, "mu": mu, "logvar": logvar, "kl": kl, "recon": recon, "loss": recon + self.config.beta * kl}
+        return {
+            "logits": logits,
+            "z": z,
+            "mu": mu,
+            "logvar": logvar,
+            "kl": kl,
+            "recon": recon,
+            "loss": recon + self.config.beta * kl,
+        }
 
 
 class LatentFlowReasoner(nn.Module):
@@ -152,17 +184,33 @@ class LatentFlowReasoner(nn.Module):
         self.config = config
         self.puzzle_emb = nn.Embedding(10, config.d_model)
         self.z_proj = nn.Linear(config.d_z, config.d_model)
-        self.time_mlp = nn.Sequential(nn.Linear(config.d_model, config.d_model), nn.SiLU(), nn.Linear(config.d_model, config.d_model))
-        self.backbone = TransformerStack(config.layers, config.d_model, config.heads, config.dropout)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(config.d_model, config.d_model),
+            nn.SiLU(),
+            nn.Linear(config.d_model, config.d_model),
+        )
+        self.backbone = TransformerStack(
+            config.layers, config.d_model, config.heads, config.dropout
+        )
         self.velocity = nn.Linear(config.d_model, config.d_z)
-        self.q_head = nn.Sequential(nn.LayerNorm(config.d_model), nn.Linear(config.d_model, config.d_model), nn.SiLU(), nn.Linear(config.d_model, 1))
+        self.q_head = nn.Sequential(
+            nn.LayerNorm(config.d_model),
+            nn.Linear(config.d_model, config.d_model),
+            nn.SiLU(),
+            nn.Linear(config.d_model, 1),
+        )
 
-    def forward(self, z_tau: torch.Tensor, puzzle_tokens: torch.Tensor, tau: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self, z_tau: torch.Tensor, puzzle_tokens: torch.Tensor, tau: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
         t = self.time_mlp(timestep_embedding(tau, self.config.d_model))[:, None, :]
         h = self.z_proj(z_tau) + self.puzzle_emb(puzzle_tokens) + t
         h = self.backbone(h)
-        return {"velocity": self.velocity(h), "q_logits": self.q_head(h.mean(dim=1)).squeeze(-1), "hidden": h}
-
+        return {
+            "velocity": self.velocity(h),
+            "q_logits": self.q_head(h.mean(dim=1)).squeeze(-1),
+            "hidden": h,
+        }
 
 
 @dataclass
@@ -179,14 +227,20 @@ class UnifiedLatentReasoner(nn.Module):
     VAE/codecs while keeping the same normalized latent-flow interface.
     """
 
-    def __init__(self, vae: SudokuVAE, reasoner: LatentFlowReasoner, task: str = "sudoku"):
+    def __init__(
+        self, vae: SudokuVAE, reasoner: LatentFlowReasoner, task: str = "sudoku"
+    ):
         super().__init__()
         if vae.config.d_z != reasoner.config.d_z:
-            raise ValueError(f"VAE d_z {vae.config.d_z} must match reasoner d_z {reasoner.config.d_z}")
+            raise ValueError(
+                f"VAE d_z {vae.config.d_z} must match reasoner d_z {reasoner.config.d_z}"
+            )
         self.task = task
         self.vae = vae
         self.reasoner = reasoner
-        self.register_buffer("latent_mean", torch.zeros(vae.config.d_z), persistent=True)
+        self.register_buffer(
+            "latent_mean", torch.zeros(vae.config.d_z), persistent=True
+        )
         self.register_buffer("latent_std", torch.ones(vae.config.d_z), persistent=True)
 
     @property
@@ -194,45 +248,96 @@ class UnifiedLatentReasoner(nn.Module):
         return self.vae.config.d_z
 
     def set_latent_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
-        mean = mean.detach().to(device=self.latent_mean.device, dtype=self.latent_mean.dtype).view(-1)
-        std = std.detach().to(device=self.latent_std.device, dtype=self.latent_std.dtype).view(-1).clamp_min(1e-6)
+        mean = (
+            mean.detach()
+            .to(device=self.latent_mean.device, dtype=self.latent_mean.dtype)
+            .view(-1)
+        )
+        std = (
+            std.detach()
+            .to(device=self.latent_std.device, dtype=self.latent_std.dtype)
+            .view(-1)
+            .clamp_min(1e-6)
+        )
         if mean.numel() != self.d_z or std.numel() != self.d_z:
             raise ValueError(f"Expected latent stats with {self.d_z} values")
         self.latent_mean.copy_(mean)
         self.latent_std.copy_(std)
 
     def stats_view(self) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.latent_mean[None, None, :], self.latent_std[None, None, :].clamp_min(1e-6)
+        return self.latent_mean[None, None, :], self.latent_std[
+            None, None, :
+        ].clamp_min(1e-6)
 
-    def encode_solution_normalized(self, puzzle_tokens: torch.Tensor, solution_classes: torch.Tensor) -> torch.Tensor:
+    def encode_solution_normalized(
+        self, puzzle_tokens: torch.Tensor, solution_classes: torch.Tensor
+    ) -> torch.Tensor:
         mu, _ = self.vae.encode(puzzle_tokens, solution_classes)
         mean, std = self.stats_view()
         return (mu - mean) / std
 
-    def decode_normalized(self, puzzle_tokens: torch.Tensor, z_norm: torch.Tensor) -> torch.Tensor:
+    def decode_normalized(
+        self, puzzle_tokens: torch.Tensor, z_norm: torch.Tensor
+    ) -> torch.Tensor:
         mean, std = self.stats_view()
         return self.vae.decode(puzzle_tokens, z_norm * std + mean)
 
-    def reasoner_step(self, z_norm: torch.Tensor, puzzle_tokens: torch.Tensor, tau: torch.Tensor) -> dict[str, torch.Tensor]:
+    def reasoner_step(
+        self, z_norm: torch.Tensor, puzzle_tokens: torch.Tensor, tau: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
         return self.reasoner(z_norm, puzzle_tokens, tau)
 
+    def rollout(
+        self,
+        puzzle_tokens: torch.Tensor,
+        r_steps: int = 8,
+        noise: torch.Tensor | None = None,
+        return_intermediates: bool = False,
+    ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        z = (
+            noise
+            if noise is not None
+            else torch.randn(
+                puzzle_tokens.shape[0], 81, self.d_z, device=puzzle_tokens.device
+            )
+        )
+        step_size = 1.0 / max(r_steps, 1)
+        intermediate_logits = []
+        for i in range(r_steps):
+            tau = torch.full(
+                (z.shape[0],), 1.0 - i * step_size, device=z.device, dtype=z.dtype
+            )
+            out = self.reasoner_step(z, puzzle_tokens, tau)
+            z = z - step_size * out["velocity"]
+            if return_intermediates and i < r_steps - 1:
+                intermediate_logits.append(self.decode_normalized(puzzle_tokens, z))
+        logits = self.decode_normalized(puzzle_tokens, z)
+        q_logits = self.reasoner_step(
+            z, puzzle_tokens, torch.zeros(z.shape[0], device=z.device, dtype=z.dtype)
+        )["q_logits"]
+        result: dict[str, torch.Tensor | list[torch.Tensor]] = {
+            "z": z,
+            "logits": logits,
+            "q_logits": q_logits,
+        }
+        if return_intermediates:
+            result["intermediate_logits"] = intermediate_logits
+        return result
+
     @torch.inference_mode()
-    def sample(self, puzzle_tokens: torch.Tensor, r_steps: int = 8, k_samples: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    def sample(
+        self, puzzle_tokens: torch.Tensor, r_steps: int = 8, k_samples: int = 1
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = puzzle_tokens.shape[0]
         puzzle_rep = puzzle_tokens.repeat_interleave(k_samples, dim=0)
-        z = torch.randn(bsz * k_samples, 81, self.d_z, device=puzzle_tokens.device)
-        step_size = 1.0 / max(r_steps, 1)
-        for i in range(r_steps):
-            tau = torch.full((z.shape[0],), 1.0 - i * step_size, device=z.device)
-            out = self.reasoner_step(z, puzzle_rep, tau)
-            z = z - step_size * out["velocity"]
-        logits = self.decode_normalized(puzzle_rep, z)
+        out = self.rollout(puzzle_rep, r_steps=r_steps)
+        logits = out["logits"]
         pred = logits.argmax(dim=-1) + 1
-        q = self.reasoner_step(z, puzzle_rep, torch.zeros(z.shape[0], device=z.device))["q_logits"]
+        q = out["q_logits"]
         pred = pred.view(bsz, k_samples, 81)
         q = q.view(bsz, k_samples)
         best = q.argmax(dim=1)
-        final = pred[torch.arange(bsz, device=z.device), best]
+        final = pred[torch.arange(bsz, device=q.device), best]
         return final, q.max(dim=1).values
 
     def config_dict(self) -> dict:
@@ -241,6 +346,7 @@ class UnifiedLatentReasoner(nn.Module):
             "vae": asdict(self.vae.config),
             "reasoner": asdict(self.reasoner.config),
         }
+
 
 def vae_config_dict(config: VAEConfig) -> dict:
     return asdict(config)
