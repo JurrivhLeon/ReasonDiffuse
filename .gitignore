@@ -15,7 +15,6 @@ env/
 
 # Datasets and downloaded/raw data
 data/
-dataset/
 datasets/
 raw_data/
 processed_data/
