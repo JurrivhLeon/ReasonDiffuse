@@ -70,6 +70,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vae-d-z", type=int, default=64)
     p.add_argument("--vae-layers", type=int, default=4)
     p.add_argument("--vae-heads", type=int, default=4)
+    p.add_argument("--vae-dropout", type=float, default=0.0)
+    p.add_argument("--vae-label-smoothing", type=float, default=0.0)
     p.add_argument("--vae-target-val-exact", type=float, default=None)
     p.add_argument("--vae-patience-evals", type=int, default=0)
     p.add_argument("--vae-min-aug-epochs", type=float, default=1.0)
@@ -87,11 +89,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ddim-d-model", type=int, default=256)
     p.add_argument("--ddim-layers", type=int, default=6)
     p.add_argument("--ddim-heads", type=int, default=8)
+    p.add_argument("--ddim-dropout", type=float, default=0.0)
     p.add_argument("--train-timesteps", type=int, default=1000)
     p.add_argument("--beta-start", type=float, default=1e-4)
     p.add_argument("--beta-end", type=float, default=2e-2)
     p.add_argument("--lambda-x0", type=float, default=1.0)
     p.add_argument("--lambda-answer", type=float, default=1.0)
+    p.add_argument("--answer-label-smoothing", type=float, default=0.0)
     p.add_argument("--lambda-q", type=float, default=0.1)
 
     p.add_argument("--rollout-batch-size", type=int, default=256)
@@ -150,7 +154,7 @@ def evaluate_ddim_reasoner(
 
 
 def ddim_pointwise_loss(
-    model: UnifiedDDIMLatentReasoner, batch, spec
+    model: UnifiedDDIMLatentReasoner, batch, spec, label_smoothing: float = 0.0
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     with torch.no_grad():
         z_star = model.encode_solution_normalized(
@@ -167,7 +171,11 @@ def ddim_pointwise_loss(
     x0_loss = F.mse_loss(out["x0_pred"], z_star)
     logits = model.decode_normalized(batch.puzzle_tokens, out["x0_pred"])
     answer_loss = answer_ce(
-        logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
+        logits,
+        batch.solution_classes,
+        model.vae.config.output_vocab_size,
+        model.vae.config.ignore_index,
+        label_smoothing,
     )
     with torch.no_grad():
         pred_tokens = logits_to_tokens(logits, spec)
@@ -234,7 +242,9 @@ def train_ddim_reasoner(
             _, raw = next(flat_iter)
             epoch_done = step * args.ddim_batch_size / train_group_count
         batch = to_device(raw, device)
-        loss, parts = ddim_pointwise_loss(model, batch, spec)
+        loss, parts = ddim_pointwise_loss(
+            model, batch, spec, args.answer_label_smoothing
+        )
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.reasoner.parameters(), 1.0)
@@ -332,7 +342,9 @@ def train_rollout(
             _, raw = next(flat_iter)
             epoch_done = step * args.rollout_batch_size / train_group_count
         batch = to_device(raw, device)
-        pointwise_loss, pointwise = ddim_pointwise_loss(model, batch, spec)
+        pointwise_loss, pointwise = ddim_pointwise_loss(
+            model, batch, spec, args.answer_label_smoothing
+        )
 
         roll_out = model.rollout(
             batch.puzzle_tokens,
@@ -341,7 +353,11 @@ def train_rollout(
         )
         logits = roll_out["logits"]
         rollout_loss = answer_ce(
-            logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
+            logits,
+            batch.solution_classes,
+            model.vae.config.output_vocab_size,
+            model.vae.config.ignore_index,
+            args.answer_label_smoothing,
         )
         intermediate_loss = logits.new_tensor(0.0)
         if args.lambda_intermediate > 0.0:
@@ -350,7 +366,11 @@ def train_rollout(
                 losses = torch.stack(
                     [
                         answer_ce(
-                            mid, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
+                            mid,
+                            batch.solution_classes,
+                            model.vae.config.output_vocab_size,
+                            model.vae.config.ignore_index,
+                            args.answer_label_smoothing,
                         )
                         for mid in intermediate_logits
                     ]
@@ -447,6 +467,7 @@ def main() -> None:
             d_z=args.vae_d_z,
             layers=args.ddim_layers,
             heads=args.ddim_heads,
+            dropout=args.ddim_dropout,
             lambda_x0=args.lambda_x0,
             lambda_answer=args.lambda_answer,
             lambda_q=args.lambda_q,

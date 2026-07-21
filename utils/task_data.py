@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from reasoner_fm import MazeVAE, SudokuVAE, VAEConfig
+from reasoner_fm import MazeVAE, SudokuVAE, VAEConfig, token_cross_entropy
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,7 @@ class TaskSpec:
         heads: int,
         beta: float,
         dropout: float = 0.0,
+        label_smoothing: float = 0.0,
     ) -> VAEConfig:
         return VAEConfig(
             d_model=d_model,
@@ -37,6 +38,7 @@ class TaskSpec:
             heads=heads,
             dropout=dropout,
             beta=beta,
+            label_smoothing=label_smoothing,
             seq_len=self.seq_len,
             input_vocab_size=self.input_vocab_size,
             output_vocab_size=self.output_vocab_size,
@@ -309,13 +311,19 @@ def exact_and_cell_accuracy(pred_tokens: torch.Tensor, target_tokens: torch.Tens
     return correct.all(dim=1).float().mean(), correct.float().mean()
 
 
-def answer_ce(logits: torch.Tensor, target_classes: torch.Tensor, output_vocab_size: int, ignore_index: int = -100) -> torch.Tensor:
-    import torch.nn.functional as F
-
-    return F.cross_entropy(
-        logits.reshape(-1, output_vocab_size),
-        target_classes.reshape(-1),
-        ignore_index=ignore_index,
+def answer_ce(
+    logits: torch.Tensor,
+    target_classes: torch.Tensor,
+    output_vocab_size: int,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    return token_cross_entropy(
+        logits,
+        target_classes,
+        output_vocab_size,
+        ignore_index,
+        label_smoothing,
     )
 
 

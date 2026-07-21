@@ -16,6 +16,7 @@ class VAEConfig:
     heads: int = 4
     dropout: float = 0.0
     beta: float = 1e-3
+    label_smoothing: float = 0.0
     seq_len: int = 81
     input_vocab_size: int = 10
     output_vocab_size: int = 9
@@ -36,6 +37,43 @@ class ReasonerConfig:
     lambda_answer: float = 1.0
     lambda_q: float = 0.1
 
+
+
+
+def token_cross_entropy(
+    logits: torch.Tensor,
+    target_classes: torch.Tensor,
+    output_vocab_size: int,
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    if label_smoothing == 0.0:
+        return F.cross_entropy(
+            logits.reshape(-1, output_vocab_size),
+            target_classes.reshape(-1),
+            ignore_index=ignore_index,
+        )
+    if not 0.0 <= label_smoothing <= 1.0:
+        raise ValueError("label_smoothing must be in [0, 1]")
+    if output_vocab_size < 2:
+        raise ValueError("label_smoothing requires at least two output classes")
+
+    flat_logits = logits.reshape(-1, output_vocab_size)
+    flat_targets = target_classes.reshape(-1)
+    valid = flat_targets != ignore_index
+    if not valid.any():
+        return flat_logits.sum() * 0.0
+
+    flat_logits = flat_logits[valid]
+    flat_targets = flat_targets[valid]
+    log_probs = F.log_softmax(flat_logits, dim=-1)
+    target_log_probs = log_probs.gather(1, flat_targets[:, None]).squeeze(1)
+    other_log_probs = log_probs.sum(dim=-1) - target_log_probs
+    eps = float(label_smoothing)
+    loss = -(1.0 - eps) * target_log_probs - eps * other_log_probs / (
+        output_vocab_size - 1
+    )
+    return loss.mean()
 
 def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     half = dim // 2
@@ -200,10 +238,12 @@ class TokenGridVAE(nn.Module):
         z = self.sample(mu, logvar)
         logits = self.decode(puzzle_tokens, z)
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
-        recon = F.cross_entropy(
-            logits.reshape(-1, self.config.output_vocab_size),
-            solution_classes.reshape(-1),
-            ignore_index=self.config.ignore_index,
+        recon = token_cross_entropy(
+            logits,
+            solution_classes,
+            self.config.output_vocab_size,
+            self.config.ignore_index,
+            self.config.label_smoothing,
         )
         return {
             "logits": logits,

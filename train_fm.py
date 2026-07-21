@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vae-d-z", type=int, default=64)
     p.add_argument("--vae-layers", type=int, default=4)
     p.add_argument("--vae-heads", type=int, default=4)
+    p.add_argument("--vae-dropout", type=float, default=0.0)
+    p.add_argument("--vae-label-smoothing", type=float, default=0.0)
     p.add_argument("--vae-target-val-exact", type=float, default=None)
     p.add_argument(
         "--vae-patience-evals",
@@ -120,8 +122,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reasoner-d-model", type=int, default=256)
     p.add_argument("--reasoner-layers", type=int, default=6)
     p.add_argument("--reasoner-heads", type=int, default=8)
+    p.add_argument("--reasoner-dropout", type=float, default=0.0)
     p.add_argument("--lambda-fm", type=float, default=1.0)
     p.add_argument("--lambda-answer", type=float, default=1.0)
+    p.add_argument("--answer-label-smoothing", type=float, default=0.0)
     p.add_argument("--lambda-q", type=float, default=0.1)
 
     p.add_argument("--rollout-batch-size", type=int, default=256)
@@ -138,7 +142,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--rollout-beta1", type=float, default=0.9)
     p.add_argument("--rollout-beta2", type=float, default=0.95)
     p.add_argument("--rollout-weight-decay", type=float, default=1.0)
-    p.add_argument("--lambda-rollout", type=float, default=0.1)
+    p.add_argument("--lambda-rollout", type=float, default=0.5)
     p.add_argument(
         "--lambda-rollout-fm", type=float, default=None, help="Defaults to --lambda-fm"
     )
@@ -333,6 +337,8 @@ def train_vae(
             layers=args.vae_layers,
             heads=args.vae_heads,
             beta=args.vae_kl_beta,
+            dropout=args.vae_dropout,
+            label_smoothing=args.vae_label_smoothing,
         )
     ).to(device)
     opt = torch.optim.AdamW(
@@ -557,7 +563,11 @@ def train_reasoner(
         z_pred = z_tau - tau[:, None, None] * out["velocity"]
         logits = model.decode_normalized(batch.puzzle_tokens, z_pred)
         answer_loss = answer_ce(
-            logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
+            logits,
+            batch.solution_classes,
+            model.vae.config.output_vocab_size,
+            model.vae.config.ignore_index,
+            args.answer_label_smoothing,
         )
         with torch.no_grad():
             pred_tokens = logits_to_tokens(logits, get_task_spec(args.task, args.data_dir))
@@ -683,7 +693,11 @@ def train_rollout(
         )
         logits = roll_out["logits"]
         rollout_loss = answer_ce(
-            logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
+            logits,
+            batch.solution_classes,
+            model.vae.config.output_vocab_size,
+            model.vae.config.ignore_index,
+            args.answer_label_smoothing,
         )
         intermediate_loss = logits.new_tensor(0.0)
         if args.lambda_intermediate > 0.0:
@@ -692,7 +706,11 @@ def train_rollout(
                 losses = torch.stack(
                     [
                         answer_ce(
-                            mid, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
+                            mid,
+                            batch.solution_classes,
+                            model.vae.config.output_vocab_size,
+                            model.vae.config.ignore_index,
+                            args.answer_label_smoothing,
                         )
                         for mid in intermediate_logits
                     ]
@@ -789,6 +807,7 @@ def main() -> None:
             d_z=args.vae_d_z,
             layers=args.reasoner_layers,
             heads=args.reasoner_heads,
+            dropout=args.reasoner_dropout,
             lambda_fm=args.lambda_fm,
             lambda_answer=args.lambda_answer,
             lambda_q=args.lambda_q,
