@@ -16,13 +16,16 @@ from reasoner_ddim import (
     UnifiedDDIMLatentReasoner,
 )
 from utils.sudoku.checkpoint import load_vae, save_ddim_unified, save_vae
-from utils.sudoku.data import (
+from utils.task_data import (
+    answer_ce,
+    exact_and_cell_accuracy,
+    get_task_spec,
     iter_group_batches,
     iter_group_eval_batches,
+    logits_to_tokens,
     split_group_ids,
     to_device,
 )
-from utils.sudoku.metrics import exact_and_cell_accuracy
 from train_fm import (
     best_path,
     compute_latent_stats,
@@ -37,6 +40,7 @@ from train_fm import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+    p.add_argument("--task", choices=("sudoku", "maze"), default="sudoku")
     p.add_argument("--data-dir", default="data/sudoku-extreme-1k-aug-1000")
     p.add_argument("--output-dir", default=None)
     p.add_argument("--run-dir", default=None)
@@ -121,13 +125,13 @@ def evaluate_ddim_reasoner(
     total = 0
     sums = {"exact": 0.0, "cell": 0.0, "q": 0.0}
     for raw in iter_group_eval_batches(
-        args.data_dir, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
+        args.data_dir, args.task, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
     ):
         batch = to_device(raw, device)
-        pred_digits, q_logits = model.sample(
+        pred_tokens, q_logits = model.sample(
             batch.puzzle_tokens, r_steps=args.val_R, k_samples=args.val_K
         )
-        exact, cell = exact_and_cell_accuracy(pred_digits, batch.solution_digits)
+        exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
         bsz = batch.puzzle_tokens.shape[0]
         total += bsz
         sums["exact"] += exact.item() * bsz
@@ -146,7 +150,7 @@ def evaluate_ddim_reasoner(
 
 
 def ddim_pointwise_loss(
-    model: UnifiedDDIMLatentReasoner, batch
+    model: UnifiedDDIMLatentReasoner, batch, spec
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     with torch.no_grad():
         z_star = model.encode_solution_normalized(
@@ -162,12 +166,12 @@ def ddim_pointwise_loss(
     out = model.reasoner_step(z_t, batch.puzzle_tokens, t_idx)
     x0_loss = F.mse_loss(out["x0_pred"], z_star)
     logits = model.decode_normalized(batch.puzzle_tokens, out["x0_pred"])
-    answer_loss = F.cross_entropy(
-        logits.reshape(-1, 9), batch.solution_classes.reshape(-1)
+    answer_loss = answer_ce(
+        logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
     )
     with torch.no_grad():
-        pred_digits = logits.argmax(dim=-1) + 1
-        q_target = pred_digits.eq(batch.solution_digits).all(dim=1).float()
+        pred_tokens = logits_to_tokens(logits, spec)
+        q_target = pred_tokens.eq(batch.solution_tokens).all(dim=1).float()
     q_loss = F.binary_cross_entropy_with_logits(out["q_logits"], q_target)
     return (
         model.reasoner.config.lambda_x0 * x0_loss
@@ -209,14 +213,16 @@ def train_ddim_reasoner(
     )
     group_iter = iter_group_batches(
         args.data_dir,
+        args.task,
         args.ddim_batch_size,
         train_group_ids,
         epochs_needed,
         seed=args.seed + 100000,
     )
     flat_iter = flat_batches(
-        args.data_dir, args.ddim_batch_size, total_steps, args.train_limit
+        args.data_dir, args.task, args.ddim_batch_size, total_steps, args.train_limit
     )
+    spec = get_task_spec(args.task, args.data_dir)
     print(
         f"stage=ddim total_steps={total_steps} epochs={args.ddim_epochs} sampling={args.sampling} train_groups={train_group_count} T={model.train_timesteps}"
     )
@@ -228,15 +234,15 @@ def train_ddim_reasoner(
             _, raw = next(flat_iter)
             epoch_done = step * args.ddim_batch_size / train_group_count
         batch = to_device(raw, device)
-        loss, parts = ddim_pointwise_loss(model, batch)
+        loss, parts = ddim_pointwise_loss(model, batch, spec)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.reasoner.parameters(), 1.0)
         set_warmup_lr(opt, args.ddim_lr, step, args.ddim_warmup_steps)
         opt.step()
         if step == 1 or step % 100 == 0:
-            pred_digits = parts["logits"].argmax(dim=-1) + 1
-            exact, cell = exact_and_cell_accuracy(pred_digits, batch.solution_digits)
+            pred_tokens = logits_to_tokens(parts["logits"], spec)
+            exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}/{args.ddim_epochs}",
                 loss=f"{loss.item():.4f}",
@@ -285,13 +291,14 @@ def train_rollout(
     )
     group_iter = iter_group_batches(
         args.data_dir,
+        args.task,
         args.rollout_batch_size,
         train_group_ids,
         epochs_needed,
         seed=args.seed + 200000,
     )
     flat_iter = flat_batches(
-        args.data_dir, args.rollout_batch_size, total_steps, args.train_limit
+        args.data_dir, args.task, args.rollout_batch_size, total_steps, args.train_limit
     )
     lambda_x0 = (
         args.lambda_x0 if args.lambda_rollout_x0 is None else args.lambda_rollout_x0
@@ -300,6 +307,7 @@ def train_rollout(
     best_unified_out = best_path(args.out, args.best_out)
     best_val_exact = -1.0
     best_val_loss = float("inf")
+    spec = get_task_spec(args.task, args.data_dir)
     if val_group_ids.size:
         init_metrics = evaluate_ddim_reasoner(model, args, device, val_group_ids)
         best_val_exact = init_metrics["exact"]
@@ -324,7 +332,7 @@ def train_rollout(
             _, raw = next(flat_iter)
             epoch_done = step * args.rollout_batch_size / train_group_count
         batch = to_device(raw, device)
-        pointwise_loss, pointwise = ddim_pointwise_loss(model, batch)
+        pointwise_loss, pointwise = ddim_pointwise_loss(model, batch, spec)
 
         roll_out = model.rollout(
             batch.puzzle_tokens,
@@ -332,8 +340,8 @@ def train_rollout(
             return_intermediates=args.lambda_intermediate > 0.0,
         )
         logits = roll_out["logits"]
-        rollout_loss = F.cross_entropy(
-            logits.reshape(-1, 9), batch.solution_classes.reshape(-1)
+        rollout_loss = answer_ce(
+            logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
         )
         intermediate_loss = logits.new_tensor(0.0)
         if args.lambda_intermediate > 0.0:
@@ -341,8 +349,8 @@ def train_rollout(
             if intermediate_logits:
                 losses = torch.stack(
                     [
-                        F.cross_entropy(
-                            mid.reshape(-1, 9), batch.solution_classes.reshape(-1)
+                        answer_ce(
+                            mid, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
                         )
                         for mid in intermediate_logits
                     ]
@@ -354,8 +362,8 @@ def train_rollout(
                 weights = weights / weights.sum().clamp_min(1e-12)
                 intermediate_loss = (weights * losses).sum()
         with torch.no_grad():
-            pred_digits = logits.argmax(dim=-1) + 1
-            q_target = pred_digits.eq(batch.solution_digits).all(dim=1).float()
+            pred_tokens = logits_to_tokens(logits, spec)
+            q_target = pred_tokens.eq(batch.solution_tokens).all(dim=1).float()
         q_loss = F.binary_cross_entropy_with_logits(roll_out["q_logits"], q_target)
         loss = (
             lambda_x0 * pointwise["x0"]
@@ -371,7 +379,7 @@ def train_rollout(
         opt.step()
 
         if step == 1 or step % 100 == 0:
-            exact, cell = exact_and_cell_accuracy(pred_digits, batch.solution_digits)
+            exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}/{rollout_epoch_target:g}",
                 loss=f"{loss.item():.4f}",
@@ -416,6 +424,7 @@ def main() -> None:
     device = torch.device(args.device)
     train_group_ids, val_group_ids = split_group_ids(
         args.data_dir,
+        args.task,
         args.val_group_fraction,
         seed=args.seed,
         limit_groups=args.train_limit if args.sampling == "group" else None,
@@ -441,6 +450,8 @@ def main() -> None:
             lambda_x0=args.lambda_x0,
             lambda_answer=args.lambda_answer,
             lambda_q=args.lambda_q,
+            seq_len=vae.config.seq_len,
+            input_vocab_size=vae.config.input_vocab_size,
         )
     ).to(device)
     schedule = DDIMScheduleConfig(
@@ -448,7 +459,9 @@ def main() -> None:
         beta_start=args.beta_start,
         beta_end=args.beta_end,
     )
-    unified = UnifiedDDIMLatentReasoner(vae, reasoner, schedule=schedule).to(device)
+    unified = UnifiedDDIMLatentReasoner(
+        vae, reasoner, schedule=schedule, task=args.task
+    ).to(device)
     unified.set_latent_stats(mean, std)
     param_counts = {
         "vae": parameter_counts(vae),

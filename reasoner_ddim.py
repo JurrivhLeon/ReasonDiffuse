@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 
 import torch
 from torch import nn
-from reasoner_fm import SudokuVAE, TransformerStack, timestep_embedding
+from reasoner_fm import TokenGridVAE, TransformerStack, timestep_embedding
 
 
 @dataclass
@@ -21,6 +21,8 @@ class DDIMReasonerConfig:
     layers: int = 6
     heads: int = 8
     dropout: float = 0.0
+    seq_len: int = 81
+    input_vocab_size: int = 10
     lambda_x0: float = 1.0
     lambda_answer: float = 1.0
     lambda_q: float = 0.1
@@ -30,7 +32,7 @@ class LatentDDIMReasoner(nn.Module):
     def __init__(self, config: DDIMReasonerConfig):
         super().__init__()
         self.config = config
-        self.puzzle_emb = nn.Embedding(10, config.d_model)
+        self.puzzle_emb = nn.Embedding(config.input_vocab_size, config.d_model)
         self.z_proj = nn.Linear(config.d_z, config.d_model)
         self.time_mlp = nn.Sequential(
             nn.Linear(config.d_model, config.d_model),
@@ -38,7 +40,11 @@ class LatentDDIMReasoner(nn.Module):
             nn.Linear(config.d_model, config.d_model),
         )
         self.backbone = TransformerStack(
-            config.layers, config.d_model, config.heads, config.dropout
+            config.layers,
+            config.d_model,
+            config.heads,
+            config.dropout,
+            seq_len=config.seq_len,
         )
         self.x0 = nn.Linear(config.d_model, config.d_z)
         self.q_head = nn.Sequential(
@@ -64,7 +70,7 @@ class LatentDDIMReasoner(nn.Module):
 class UnifiedDDIMLatentReasoner(nn.Module):
     def __init__(
         self,
-        vae: SudokuVAE,
+        vae: TokenGridVAE,
         reasoner: LatentDDIMReasoner,
         schedule: DDIMScheduleConfig | None = None,
         task: str = "sudoku",
@@ -73,6 +79,14 @@ class UnifiedDDIMLatentReasoner(nn.Module):
         if vae.config.d_z != reasoner.config.d_z:
             raise ValueError(
                 f"VAE d_z {vae.config.d_z} must match reasoner d_z {reasoner.config.d_z}"
+            )
+        if vae.config.seq_len != reasoner.config.seq_len:
+            raise ValueError(
+                f"VAE seq_len {vae.config.seq_len} must match reasoner seq_len {reasoner.config.seq_len}"
+            )
+        if vae.config.input_vocab_size != reasoner.config.input_vocab_size:
+            raise ValueError(
+                f"VAE input_vocab_size {vae.config.input_vocab_size} must match reasoner input_vocab_size {reasoner.config.input_vocab_size}"
             )
         self.task = task
         self.vae = vae
@@ -87,6 +101,10 @@ class UnifiedDDIMLatentReasoner(nn.Module):
     @property
     def d_z(self) -> int:
         return self.vae.config.d_z
+
+    @property
+    def seq_len(self) -> int:
+        return self.vae.config.seq_len
 
     @property
     def train_timesteps(self) -> int:
@@ -214,7 +232,10 @@ class UnifiedDDIMLatentReasoner(nn.Module):
             noise
             if noise is not None
             else torch.randn(
-                puzzle_tokens.shape[0], 81, self.d_z, device=puzzle_tokens.device
+                puzzle_tokens.shape[0],
+                self.seq_len,
+                self.d_z,
+                device=puzzle_tokens.device,
             )
         )
         timesteps = self.ddim_timesteps(r_steps, z.device)
@@ -250,12 +271,14 @@ class UnifiedDDIMLatentReasoner(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = puzzle_tokens.shape[0]
         puzzle_rep = puzzle_tokens.repeat_interleave(k_samples, dim=0)
-        z = torch.randn(bsz * k_samples, 81, self.d_z, device=puzzle_tokens.device)
+        z = torch.randn(
+            bsz * k_samples, self.seq_len, self.d_z, device=puzzle_tokens.device
+        )
         out = self.rollout(puzzle_rep, r_steps=r_steps, noise=z)
         logits = out["logits"]
-        pred = logits.argmax(dim=-1) + 1
+        pred = logits.argmax(dim=-1) + self.vae.config.prediction_offset
         q = out["q_logits"]
-        pred = pred.view(bsz, k_samples, 81)
+        pred = pred.view(bsz, k_samples, self.seq_len)
         q = q.view(bsz, k_samples)
         best = q.argmax(dim=1)
         final = pred[torch.arange(bsz, device=q.device), best]
@@ -264,6 +287,7 @@ class UnifiedDDIMLatentReasoner(nn.Module):
     def config_dict(self) -> dict:
         return {
             "task": self.task,
+            "vae_type": self.vae.__class__.__name__,
             "vae": asdict(self.vae.config),
             "reasoner": asdict(self.reasoner.config),
             "schedule": asdict(self.schedule_config),

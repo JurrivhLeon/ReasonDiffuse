@@ -2,9 +2,11 @@
 
 from reasoner_fm import (  # noqa: F401
     LatentFlowReasoner,
+    MazeVAE,
     ReasonerConfig,
     RotarySelfAttention,
     SudokuVAE,
+    TokenGridVAE,
     UnifiedConfig,
     UnifiedLatentReasoner,
     TransformerBlock,

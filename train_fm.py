@@ -14,24 +14,28 @@ from tqdm import tqdm
 from reasoner_fm import (
     LatentFlowReasoner,
     ReasonerConfig,
-    SudokuVAE,
+    TokenGridVAE,
     UnifiedLatentReasoner,
-    VAEConfig,
 )
 from utils.sudoku.checkpoint import load_vae, save_json, save_unified, save_vae
-from utils.sudoku.data import (
+from utils.task_data import (
+    TaskArrays,
+    answer_ce,
+    exact_and_cell_accuracy,
+    get_task_spec,
     iter_group_all_example_batches,
     iter_group_batches,
     iter_group_eval_batches,
+    logits_to_tokens,
     make_loader,
     split_group_ids,
     to_device,
 )
-from utils.sudoku.metrics import exact_and_cell_accuracy
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+    p.add_argument("--task", choices=("sudoku", "maze"), default="sudoku")
     p.add_argument("--data-dir", default="data/sudoku-extreme-1k-aug-1000")
     p.add_argument(
         "--output-dir",
@@ -164,7 +168,7 @@ def configure_output_paths(args: argparse.Namespace) -> None:
         output_dir = (
             Path(args.output_dir)
             if args.output_dir is not None
-            else Path("checkpoints") / "sudoku"
+            else Path("checkpoints") / args.task
         )
         run_dir = output_dir / f"run_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -215,13 +219,10 @@ def set_warmup_lr(
 
 
 def augmented_train_examples(
-    data_dir: str, train_group_count: int, train_limit: int | None
+    data_dir: str, task: str, train_group_count: int, train_limit: int | None
 ) -> int:
     if train_limit is not None:
-        # In group mode, train_limit limits groups. Each Sudoku augmented puzzle has one row.
-        from utils.sudoku.data import SudokuArrays
-
-        arrays = SudokuArrays(data_dir, split="train")
+        arrays = TaskArrays(data_dir, task=task, split="train")
         total = 0
         for group_id in range(min(train_group_count, arrays.total_groups)):
             total += int(
@@ -240,9 +241,9 @@ def augmented_train_examples(
 
 
 def flat_batches(
-    data_dir: str, batch_size: int, total_steps: int, train_limit: int | None
+    data_dir: str, task: str, batch_size: int, total_steps: int, train_limit: int | None
 ):
-    loader = make_loader(data_dir, "train", batch_size, shuffle=True, limit=train_limit)
+    loader = make_loader(data_dir, task, "train", batch_size, shuffle=True, limit=train_limit)
     it = iter(loader)
     for step in range(1, total_steps + 1):
         try:
@@ -255,19 +256,20 @@ def flat_batches(
 
 @torch.inference_mode()
 def evaluate_vae(
-    model: SudokuVAE, args: argparse.Namespace, device: torch.device, val_group_ids
+    model: TokenGridVAE, args: argparse.Namespace, device: torch.device, val_group_ids
 ) -> dict[str, float]:
+    spec = get_task_spec(args.task, args.data_dir)
     was_training = model.training
     model.eval()
     total = 0
     sums = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "exact": 0.0, "cell": 0.0}
     for raw in iter_group_eval_batches(
-        args.data_dir, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
+        args.data_dir, args.task, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
     ):
         batch = to_device(raw, device)
         out = model(batch.puzzle_tokens, batch.solution_classes)
-        pred = out["logits"].argmax(dim=-1) + 1
-        exact, cell = exact_and_cell_accuracy(pred, batch.solution_digits)
+        pred = logits_to_tokens(out["logits"], spec)
+        exact, cell = exact_and_cell_accuracy(pred, batch.solution_tokens)
         bsz = batch.puzzle_tokens.shape[0]
         total += bsz
         sums["loss"] += out["loss"].item() * bsz
@@ -295,13 +297,13 @@ def evaluate_reasoner(
     total = 0
     sums = {"exact": 0.0, "cell": 0.0, "q": 0.0}
     for raw in iter_group_eval_batches(
-        args.data_dir, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
+        args.data_dir, args.task, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
     ):
         batch = to_device(raw, device)
-        pred_digits, q_logits = model.sample(
+        pred_tokens, q_logits = model.sample(
             batch.puzzle_tokens, r_steps=args.val_R, k_samples=args.val_K
         )
-        exact, cell = exact_and_cell_accuracy(pred_digits, batch.solution_digits)
+        exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
         bsz = batch.puzzle_tokens.shape[0]
         total += bsz
         sums["exact"] += exact.item() * bsz
@@ -322,9 +324,10 @@ def evaluate_reasoner(
 
 def train_vae(
     args: argparse.Namespace, device: torch.device, train_group_ids, val_group_ids
-) -> SudokuVAE:
-    model = SudokuVAE(
-        VAEConfig(
+) -> TokenGridVAE:
+    spec = get_task_spec(args.task, args.data_dir)
+    model = spec.make_vae(
+        spec.make_vae_config(
             d_model=args.vae_d_model,
             d_z=args.vae_d_z,
             layers=args.vae_layers,
@@ -346,6 +349,7 @@ def train_vae(
     train_group_count = max(len(train_group_ids), 1)
     min_aug_examples = augmented_train_examples(
         args.data_dir,
+        args.task,
         train_group_count,
         args.train_limit if args.sampling == "group" else None,
     )
@@ -360,13 +364,14 @@ def train_vae(
     )
     group_iter = iter_group_batches(
         args.data_dir,
+        args.task,
         args.vae_batch_size,
         train_group_ids,
         epochs_needed,
         seed=args.seed,
     )
     flat_iter = flat_batches(
-        args.data_dir, args.vae_batch_size, args.vae_max_steps, args.train_limit
+        args.data_dir, args.task, args.vae_batch_size, args.vae_max_steps, args.train_limit
     )
     print(
         f"stage=vae max_steps={args.vae_max_steps} sampling={args.sampling} eval_every_epochs={args.eval_every_epochs} min_aug_examples={min_aug_examples} min_early_stop_steps={min_early_stop_steps}"
@@ -388,8 +393,8 @@ def train_vae(
         set_warmup_lr(opt, args.vae_lr, step, args.vae_warmup_steps)
         opt.step()
         if step == 1 or step % 100 == 0:
-            pred = out["logits"].argmax(dim=-1) + 1
-            exact, cell = exact_and_cell_accuracy(pred, batch.solution_digits)
+            pred = logits_to_tokens(out["logits"], spec)
+            exact, cell = exact_and_cell_accuracy(pred, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}",
                 loss=f"{out['loss'].item():.4f}",
@@ -456,7 +461,7 @@ def train_vae(
 
 @torch.inference_mode()
 def compute_latent_stats(
-    args: argparse.Namespace, device: torch.device, vae: SudokuVAE, train_group_ids
+    args: argparse.Namespace, device: torch.device, vae: TokenGridVAE, train_group_ids
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     vae.eval()
     count = 0
@@ -465,7 +470,7 @@ def compute_latent_stats(
     print("stage=stats")
     for raw in tqdm(
         iter_group_all_example_batches(
-            args.data_dir, args.stats_batch_size, train_group_ids
+            args.data_dir, args.task, args.stats_batch_size, train_group_ids
         ),
         desc="stats",
     ):
@@ -518,13 +523,14 @@ def train_reasoner(
     )
     group_iter = iter_group_batches(
         args.data_dir,
+        args.task,
         args.reasoner_batch_size,
         train_group_ids,
         epochs_needed,
         seed=args.seed + 100000,
     )
     flat_iter = flat_batches(
-        args.data_dir, args.reasoner_batch_size, total_steps, args.train_limit
+        args.data_dir, args.task, args.reasoner_batch_size, total_steps, args.train_limit
     )
     print(
         f"stage=reasoner total_steps={total_steps} epochs={args.reasoner_epochs} sampling={args.sampling} train_groups={train_group_count}"
@@ -550,12 +556,12 @@ def train_reasoner(
         fm_loss = F.mse_loss(out["velocity"], target_v)
         z_pred = z_tau - tau[:, None, None] * out["velocity"]
         logits = model.decode_normalized(batch.puzzle_tokens, z_pred)
-        answer_loss = F.cross_entropy(
-            logits.reshape(-1, 9), batch.solution_classes.reshape(-1)
+        answer_loss = answer_ce(
+            logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
         )
         with torch.no_grad():
-            pred_digits = logits.argmax(dim=-1) + 1
-            q_target = pred_digits.eq(batch.solution_digits).all(dim=1).float()
+            pred_tokens = logits_to_tokens(logits, get_task_spec(args.task, args.data_dir))
+            q_target = pred_tokens.eq(batch.solution_tokens).all(dim=1).float()
         q_loss = F.binary_cross_entropy_with_logits(out["q_logits"], q_target)
         loss = (
             cfg.lambda_fm * fm_loss
@@ -568,7 +574,7 @@ def train_reasoner(
         set_warmup_lr(opt, args.reasoner_lr, step, args.reasoner_warmup_steps)
         opt.step()
         if step == 1 or step % 100 == 0:
-            exact, cell = exact_and_cell_accuracy(pred_digits, batch.solution_digits)
+            exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}/{args.reasoner_epochs}",
                 loss=f"{loss.item():.4f}",
@@ -618,13 +624,14 @@ def train_rollout(
     )
     group_iter = iter_group_batches(
         args.data_dir,
+        args.task,
         args.rollout_batch_size,
         train_group_ids,
         epochs_needed,
         seed=args.seed + 200000,
     )
     flat_iter = flat_batches(
-        args.data_dir, args.rollout_batch_size, total_steps, args.train_limit
+        args.data_dir, args.task, args.rollout_batch_size, total_steps, args.train_limit
     )
     lambda_fm = (
         args.lambda_fm if args.lambda_rollout_fm is None else args.lambda_rollout_fm
@@ -675,8 +682,8 @@ def train_rollout(
             return_intermediates=args.lambda_intermediate > 0.0,
         )
         logits = roll_out["logits"]
-        rollout_loss = F.cross_entropy(
-            logits.reshape(-1, 9), batch.solution_classes.reshape(-1)
+        rollout_loss = answer_ce(
+            logits, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
         )
         intermediate_loss = logits.new_tensor(0.0)
         if args.lambda_intermediate > 0.0:
@@ -684,8 +691,8 @@ def train_rollout(
             if intermediate_logits:
                 losses = torch.stack(
                     [
-                        F.cross_entropy(
-                            mid.reshape(-1, 9), batch.solution_classes.reshape(-1)
+                        answer_ce(
+                            mid, batch.solution_classes, model.vae.config.output_vocab_size, model.vae.config.ignore_index
                         )
                         for mid in intermediate_logits
                     ]
@@ -697,8 +704,8 @@ def train_rollout(
                 weights = weights / weights.sum().clamp_min(1e-12)
                 intermediate_loss = (weights * losses).sum()
         with torch.no_grad():
-            pred_digits = logits.argmax(dim=-1) + 1
-            q_target = pred_digits.eq(batch.solution_digits).all(dim=1).float()
+            pred_tokens = logits_to_tokens(logits, get_task_spec(args.task, args.data_dir))
+            q_target = pred_tokens.eq(batch.solution_tokens).all(dim=1).float()
         q_loss = F.binary_cross_entropy_with_logits(roll_out["q_logits"], q_target)
         loss = (
             lambda_fm * fm_loss
@@ -714,7 +721,7 @@ def train_rollout(
         opt.step()
 
         if step == 1 or step % 100 == 0:
-            exact, cell = exact_and_cell_accuracy(pred_digits, batch.solution_digits)
+            exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}/{rollout_epoch_target:g}",
                 loss=f"{loss.item():.4f}",
@@ -759,6 +766,7 @@ def main() -> None:
     device = torch.device(args.device)
     train_group_ids, val_group_ids = split_group_ids(
         args.data_dir,
+        args.task,
         args.val_group_fraction,
         seed=args.seed,
         limit_groups=args.train_limit if args.sampling == "group" else None,
@@ -784,9 +792,11 @@ def main() -> None:
             lambda_fm=args.lambda_fm,
             lambda_answer=args.lambda_answer,
             lambda_q=args.lambda_q,
+            seq_len=vae.config.seq_len,
+            input_vocab_size=vae.config.input_vocab_size,
         )
     ).to(device)
-    unified = UnifiedLatentReasoner(vae, reasoner).to(device)
+    unified = UnifiedLatentReasoner(vae, reasoner, task=args.task).to(device)
     unified.set_latent_stats(mean, std)
     param_counts = {
         "vae": parameter_counts(vae),

@@ -16,6 +16,11 @@ class VAEConfig:
     heads: int = 4
     dropout: float = 0.0
     beta: float = 1e-3
+    seq_len: int = 81
+    input_vocab_size: int = 10
+    output_vocab_size: int = 9
+    ignore_index: int = -100
+    prediction_offset: int = 1
 
 
 @dataclass
@@ -25,6 +30,8 @@ class ReasonerConfig:
     layers: int = 6
     heads: int = 8
     dropout: float = 0.0
+    seq_len: int = 81
+    input_vocab_size: int = 10
     lambda_fm: float = 1.0
     lambda_answer: float = 1.0
     lambda_q: float = 0.1
@@ -92,10 +99,12 @@ class RotarySelfAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, heads: int, dropout: float = 0.0):
+    def __init__(
+        self, d_model: int, heads: int, dropout: float = 0.0, seq_len: int = 81
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = RotarySelfAttention(d_model, heads, dropout)
+        self.attn = RotarySelfAttention(d_model, heads, dropout, seq_len=seq_len)
         self.norm2 = nn.LayerNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
@@ -112,10 +121,20 @@ class TransformerBlock(nn.Module):
 
 
 class TransformerStack(nn.Module):
-    def __init__(self, layers: int, d_model: int, heads: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        layers: int,
+        d_model: int,
+        heads: int,
+        dropout: float = 0.0,
+        seq_len: int = 81,
+    ):
         super().__init__()
         self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, heads, dropout) for _ in range(layers)]
+            [
+                TransformerBlock(d_model, heads, dropout, seq_len=seq_len)
+                for _ in range(layers)
+            ]
         )
         self.norm = nn.LayerNorm(d_model)
 
@@ -125,26 +144,41 @@ class TransformerStack(nn.Module):
         return self.norm(x)
 
 
-class SudokuVAE(nn.Module):
+class TokenGridVAE(nn.Module):
     def __init__(self, config: VAEConfig):
         super().__init__()
         self.config = config
-        self.puzzle_emb = nn.Embedding(10, config.d_model)
-        self.solution_emb = nn.Embedding(9, config.d_model)
+        self.puzzle_emb = nn.Embedding(config.input_vocab_size, config.d_model)
+        self.solution_emb = nn.Embedding(config.output_vocab_size, config.d_model)
         self.encoder = TransformerStack(
-            config.layers, config.d_model, config.heads, config.dropout
+            config.layers,
+            config.d_model,
+            config.heads,
+            config.dropout,
+            seq_len=config.seq_len,
         )
         self.to_mu_logvar = nn.Linear(config.d_model, 2 * config.d_z)
         self.z_proj = nn.Linear(config.d_z, config.d_model)
         self.decoder = TransformerStack(
-            config.layers, config.d_model, config.heads, config.dropout
+            config.layers,
+            config.d_model,
+            config.heads,
+            config.dropout,
+            seq_len=config.seq_len,
         )
-        self.out = nn.Linear(config.d_model, 9)
+        self.out = nn.Linear(config.d_model, config.output_vocab_size)
 
     def encode(
         self, puzzle_tokens: torch.Tensor, solution_classes: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        h = self.puzzle_emb(puzzle_tokens) + self.solution_emb(solution_classes)
+        if puzzle_tokens.shape[1] != self.config.seq_len:
+            raise ValueError(
+                f"Expected puzzle seq_len={self.config.seq_len}, got {puzzle_tokens.shape[1]}"
+            )
+        solution_emb_classes = solution_classes.masked_fill(
+            solution_classes == self.config.ignore_index, 0
+        )
+        h = self.puzzle_emb(puzzle_tokens) + self.solution_emb(solution_emb_classes)
         h = self.encoder(h)
         mu, logvar = self.to_mu_logvar(h).chunk(2, dim=-1)
         return mu, logvar.clamp(min=-10.0, max=10.0)
@@ -166,7 +200,11 @@ class SudokuVAE(nn.Module):
         z = self.sample(mu, logvar)
         logits = self.decode(puzzle_tokens, z)
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
-        recon = F.cross_entropy(logits.reshape(-1, 9), solution_classes.reshape(-1))
+        recon = F.cross_entropy(
+            logits.reshape(-1, self.config.output_vocab_size),
+            solution_classes.reshape(-1),
+            ignore_index=self.config.ignore_index,
+        )
         return {
             "logits": logits,
             "z": z,
@@ -178,11 +216,33 @@ class SudokuVAE(nn.Module):
         }
 
 
+class SudokuVAE(TokenGridVAE):
+    def __init__(self, config: VAEConfig):
+        super().__init__(config)
+
+
+class MazeVAE(TokenGridVAE):
+    def __init__(self, config: VAEConfig | None = None):
+        if config is None:
+            config = VAEConfig()
+        defaults = VAEConfig()
+        values = asdict(config)
+        if config.seq_len == defaults.seq_len:
+            values["seq_len"] = 900
+        if config.input_vocab_size == defaults.input_vocab_size:
+            values["input_vocab_size"] = 6
+        if config.output_vocab_size == defaults.output_vocab_size:
+            values["output_vocab_size"] = 5
+        if config.prediction_offset == defaults.prediction_offset:
+            values["prediction_offset"] = 0
+        super().__init__(VAEConfig(**values))
+
+
 class LatentFlowReasoner(nn.Module):
     def __init__(self, config: ReasonerConfig):
         super().__init__()
         self.config = config
-        self.puzzle_emb = nn.Embedding(10, config.d_model)
+        self.puzzle_emb = nn.Embedding(config.input_vocab_size, config.d_model)
         self.z_proj = nn.Linear(config.d_z, config.d_model)
         self.time_mlp = nn.Sequential(
             nn.Linear(config.d_model, config.d_model),
@@ -190,7 +250,11 @@ class LatentFlowReasoner(nn.Module):
             nn.Linear(config.d_model, config.d_model),
         )
         self.backbone = TransformerStack(
-            config.layers, config.d_model, config.heads, config.dropout
+            config.layers,
+            config.d_model,
+            config.heads,
+            config.dropout,
+            seq_len=config.seq_len,
         )
         self.velocity = nn.Linear(config.d_model, config.d_z)
         self.q_head = nn.Sequential(
@@ -228,12 +292,20 @@ class UnifiedLatentReasoner(nn.Module):
     """
 
     def __init__(
-        self, vae: SudokuVAE, reasoner: LatentFlowReasoner, task: str = "sudoku"
+        self, vae: TokenGridVAE, reasoner: LatentFlowReasoner, task: str = "sudoku"
     ):
         super().__init__()
         if vae.config.d_z != reasoner.config.d_z:
             raise ValueError(
                 f"VAE d_z {vae.config.d_z} must match reasoner d_z {reasoner.config.d_z}"
+            )
+        if vae.config.seq_len != reasoner.config.seq_len:
+            raise ValueError(
+                f"VAE seq_len {vae.config.seq_len} must match reasoner seq_len {reasoner.config.seq_len}"
+            )
+        if vae.config.input_vocab_size != reasoner.config.input_vocab_size:
+            raise ValueError(
+                f"VAE input_vocab_size {vae.config.input_vocab_size} must match reasoner input_vocab_size {reasoner.config.input_vocab_size}"
             )
         self.task = task
         self.vae = vae
@@ -246,6 +318,10 @@ class UnifiedLatentReasoner(nn.Module):
     @property
     def d_z(self) -> int:
         return self.vae.config.d_z
+
+    @property
+    def seq_len(self) -> int:
+        return self.vae.config.seq_len
 
     def set_latent_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         mean = (
@@ -299,7 +375,10 @@ class UnifiedLatentReasoner(nn.Module):
             noise
             if noise is not None
             else torch.randn(
-                puzzle_tokens.shape[0], 81, self.d_z, device=puzzle_tokens.device
+                puzzle_tokens.shape[0],
+                self.seq_len,
+                self.d_z,
+                device=puzzle_tokens.device,
             )
         )
         tau_start = float(tau_start)
@@ -341,7 +420,9 @@ class UnifiedLatentReasoner(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = puzzle_tokens.shape[0]
         puzzle_rep = puzzle_tokens.repeat_interleave(k_samples, dim=0)
-        z = torch.randn(bsz * k_samples, 81, self.d_z, device=puzzle_tokens.device)
+        z = torch.randn(
+            bsz * k_samples, self.seq_len, self.d_z, device=puzzle_tokens.device
+        )
         out = self.rollout(puzzle_rep, r_steps=r_steps, noise=z, tau_start=1.0)
         z = out["z"]
         for _ in range(max(int(cycles), 1) - 1):
@@ -353,9 +434,9 @@ class UnifiedLatentReasoner(nn.Module):
             )
             z = out["z"]
         logits = out["logits"]
-        pred = logits.argmax(dim=-1) + 1
+        pred = logits.argmax(dim=-1) + self.vae.config.prediction_offset
         q = out["q_logits"]
-        pred = pred.view(bsz, k_samples, 81)
+        pred = pred.view(bsz, k_samples, self.seq_len)
         q = q.view(bsz, k_samples)
         best = q.argmax(dim=1)
         final = pred[torch.arange(bsz, device=q.device), best]
@@ -364,6 +445,7 @@ class UnifiedLatentReasoner(nn.Module):
     def config_dict(self) -> dict:
         return {
             "task": self.task,
+            "vae_type": self.vae.__class__.__name__,
             "vae": asdict(self.vae.config),
             "reasoner": asdict(self.reasoner.config),
         }

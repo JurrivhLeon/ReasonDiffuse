@@ -10,12 +10,13 @@ import torch
 from tqdm import tqdm
 
 from utils.sudoku.checkpoint import load_ddim_unified
-from utils.sudoku.data import make_loader, to_device
-from utils.sudoku.metrics import exact_and_cell_accuracy, sudoku_violations
+from utils.task_data import exact_and_cell_accuracy, make_loader, to_device
+from utils.sudoku.metrics import sudoku_violations
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
+    p.add_argument("--task", choices=("sudoku", "maze"), default="sudoku")
     p.add_argument("--data-dir", default="data/sudoku-smoke")
     p.add_argument("--model", default="checkpoints/sudoku/ddim/unified.pt")
     p.add_argument("--split", default="test")
@@ -48,7 +49,7 @@ def main() -> None:
     model, _ = load_ddim_unified(args.model, device)
     model.eval()
     loader = make_loader(
-        args.data_dir, args.split, args.batch_size, shuffle=False, limit=args.limit
+        args.data_dir, args.task, args.split, args.batch_size, shuffle=False, limit=args.limit
     )
 
     n = 0
@@ -61,19 +62,20 @@ def main() -> None:
     for raw in progress:
         batch = to_device(raw, device)
         pred, q = sample_batch(model, batch.puzzle_tokens, args.R, args.K)
-        exact, cell = exact_and_cell_accuracy(pred, batch.solution_digits)
-        violations = sudoku_violations(pred)
+        exact, cell = exact_and_cell_accuracy(pred, batch.solution_tokens)
+        violations = sudoku_violations(pred) if args.task == "sudoku" else None
         bsz = pred.shape[0]
         n += bsz
         exact_sum += exact.item() * bsz
         cell_sum += cell.item() * bsz
-        violation_sum += violations.float().mean().item() * bsz
+        if violations is not None:
+            violation_sum += violations.float().mean().item() * bsz
         q_sum += q.sigmoid().mean().item() * bsz
         progress.set_postfix(
             n=f"{n}/{total}",
             exact=f"{exact_sum/n:.4f}",
             cell=f"{cell_sum/n:.4f}",
-            violations=f"{violation_sum/n:.2f}",
+            violations=f"{violation_sum/n:.2f}" if args.task == "sudoku" else "n/a",
             q=f"{q_sum/n:.4f}",
         )
 
@@ -81,12 +83,15 @@ def main() -> None:
         "n": n,
         "exact": exact_sum / max(n, 1),
         "cell": cell_sum / max(n, 1),
-        "violations": violation_sum / max(n, 1),
+        "violations": violation_sum / max(n, 1) if args.task == "sudoku" else None,
         "q_mean": q_sum / max(n, 1),
     }
+    violation_text = (
+        f"{metrics['violations']:.4f}" if metrics["violations"] is not None else "n/a"
+    )
     print(
         f"n={n} exact={metrics['exact']:.4f} cell={metrics['cell']:.4f} "
-        f"violations={metrics['violations']:.4f} q_mean={metrics['q_mean']:.4f} "
+        f"violations={violation_text} q_mean={metrics['q_mean']:.4f} "
         f"R={args.R} K={args.K}"
     )
 
