@@ -458,6 +458,8 @@ class UnifiedLatentReasoner(nn.Module):
         cycle_tau_start: float = 0.25,
         cycle_noise: float = 0.25,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if r_steps < 1:
+            raise ValueError("r_steps must be positive")
         bsz = puzzle_tokens.shape[0]
         puzzle_rep = puzzle_tokens.repeat_interleave(k_samples, dim=0)
         z = torch.randn(
@@ -465,12 +467,32 @@ class UnifiedLatentReasoner(nn.Module):
         )
         out = self.rollout(puzzle_rep, r_steps=r_steps, noise=z, tau_start=1.0)
         z = out["z"]
-        for _ in range(max(int(cycles), 1) - 1):
+        num_cycles = max(int(cycles), 1)
+        if num_cycles > 1:
+            cycle_tau_start = float(cycle_tau_start)
+            if not 0.0 < cycle_tau_start <= 1.0:
+                raise ValueError(
+                    "cycle_tau_start must be in (0, 1] for refinement cycles"
+                )
+            refinement_steps_float = cycle_tau_start * r_steps
+            refinement_steps = int(round(refinement_steps_float))
+            if abs(refinement_steps_float - refinement_steps) > 1e-6:
+                raise ValueError(
+                    "cycle_tau_start must be divisible by the full-cycle Euler step size 1/R"
+                )
+            if refinement_steps < 1:
+                raise ValueError(
+                    "cycle_tau_start is too small for the requested r_steps"
+                )
+        for _ in range(num_cycles - 1):
             eps = torch.randn_like(z)
             alpha = float(cycle_noise)
             z = (1.0 - alpha) * z + alpha * eps
             out = self.rollout(
-                puzzle_rep, r_steps=r_steps, noise=z, tau_start=cycle_tau_start
+                puzzle_rep,
+                r_steps=refinement_steps,
+                noise=z,
+                tau_start=cycle_tau_start,
             )
             z = out["z"]
         logits = out["logits"]

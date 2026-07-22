@@ -174,6 +174,16 @@ def main() -> None:
     sampled, q = unified.sample(puzzle, r_steps=1, k_samples=2)
     assert sampled.shape == (4, 81)
     assert q.shape == (4,)
+    sampled, q = unified.sample(
+        puzzle, r_steps=4, k_samples=1, cycles=2, cycle_tau_start=0.25
+    )
+    assert sampled.shape == (4, 81)
+    try:
+        unified.sample(puzzle, r_steps=4, k_samples=1, cycles=2, cycle_tau_start=0.3)
+    except ValueError as exc:
+        assert "divisible" in str(exc)
+    else:
+        raise AssertionError("Expected non-divisible cycle_tau_start to fail")
 
     ddim_reasoner = LatentDDIMReasoner(
         DDIMReasonerConfig(d_model=32, d_z=16, layers=1, heads=4)
