@@ -17,6 +17,7 @@ class VAEConfig:
     dropout: float = 0.0
     beta: float = 1e-3
     label_smoothing: float = 0.0
+    stablemax: bool = True
     seq_len: int = 81
     input_vocab_size: int = 10
     output_vocab_size: int = 9
@@ -38,6 +39,12 @@ class ReasonerConfig:
     lambda_q: float = 0.1
 
 
+def _stablemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    logits = logits.float()
+    positive = logits + 1.0
+    negative = 1.0 / (1.0 - logits)
+    weights = torch.where(logits >= 0, positive, negative)
+    return weights / weights.sum(dim=dim, keepdim=True).clamp_min(1e-30)
 
 
 def token_cross_entropy(
@@ -46,8 +53,11 @@ def token_cross_entropy(
     output_vocab_size: int,
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
+    stablemax: bool = True,
 ) -> torch.Tensor:
-    if label_smoothing == 0.0:
+    if stablemax and label_smoothing != 0.0:
+        raise ValueError("stablemax and label_smoothing should not be combined")
+    if label_smoothing == 0.0 and not stablemax:
         return F.cross_entropy(
             logits.reshape(-1, output_vocab_size),
             target_classes.reshape(-1),
@@ -55,7 +65,7 @@ def token_cross_entropy(
         )
     if not 0.0 <= label_smoothing <= 1.0:
         raise ValueError("label_smoothing must be in [0, 1]")
-    if output_vocab_size < 2:
+    if output_vocab_size < 2 and label_smoothing > 0.0:
         raise ValueError("label_smoothing requires at least two output classes")
 
     flat_logits = logits.reshape(-1, output_vocab_size)
@@ -66,6 +76,10 @@ def token_cross_entropy(
 
     flat_logits = flat_logits[valid]
     flat_targets = flat_targets[valid]
+    if stablemax:
+        log_probs = _stablemax(flat_logits, dim=-1).clamp_min(1e-30).log()
+        return -log_probs.gather(1, flat_targets[:, None]).squeeze(1).mean()
+
     log_probs = F.log_softmax(flat_logits, dim=-1)
     target_log_probs = log_probs.gather(1, flat_targets[:, None]).squeeze(1)
     other_log_probs = log_probs.sum(dim=-1) - target_log_probs
@@ -74,6 +88,7 @@ def token_cross_entropy(
         output_vocab_size - 1
     )
     return loss.mean()
+
 
 def timestep_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     half = dim // 2
@@ -244,6 +259,7 @@ class TokenGridVAE(nn.Module):
             self.config.output_vocab_size,
             self.config.ignore_index,
             self.config.label_smoothing,
+            self.config.stablemax,
         )
         return {
             "logits": logits,
@@ -474,23 +490,13 @@ class UnifiedLatentReasoner(nn.Module):
                 raise ValueError(
                     "cycle_tau_start must be in (0, 1] for refinement cycles"
                 )
-            refinement_steps_float = cycle_tau_start * r_steps
-            refinement_steps = int(round(refinement_steps_float))
-            if abs(refinement_steps_float - refinement_steps) > 1e-6:
-                raise ValueError(
-                    "cycle_tau_start must be divisible by the full-cycle Euler step size 1/R"
-                )
-            if refinement_steps < 1:
-                raise ValueError(
-                    "cycle_tau_start is too small for the requested r_steps"
-                )
         for _ in range(num_cycles - 1):
             eps = torch.randn_like(z)
             alpha = float(cycle_noise)
             z = (1.0 - alpha) * z + alpha * eps
             out = self.rollout(
                 puzzle_rep,
-                r_steps=refinement_steps,
+                r_steps=r_steps,
                 noise=z,
                 tau_start=cycle_tau_start,
             )

@@ -15,6 +15,7 @@ from reasoner_ddim import (
     LatentDDIMReasoner,
     UnifiedDDIMLatentReasoner,
 )
+from utils.ema import ModuleEMA, make_ema
 from utils.sudoku.checkpoint import load_vae, save_ddim_unified, save_vae
 from utils.task_data import (
     answer_ce,
@@ -30,8 +31,10 @@ from train_fm import (
     best_path,
     compute_latent_stats,
     configure_output_paths,
+    evaluate_with_optional_ema,
     flat_batches,
     parameter_counts,
+    save_with_optional_ema,
     set_warmup_lr,
     train_vae,
     update_config_json,
@@ -72,6 +75,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vae-heads", type=int, default=4)
     p.add_argument("--vae-dropout", type=float, default=0.0)
     p.add_argument("--vae-label-smoothing", type=float, default=0.0)
+    p.add_argument(
+        "--stablemax",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use StableMax cross entropy for VAE and DDIM answer losses",
+    )
+    p.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.0,
+        help="Reasoner EMA decay for DDIM/rollout stages; 0 disables EMA, typical values are 0.999 or 0.9999",
+    )
     p.add_argument("--vae-target-val-exact", type=float, default=None)
     p.add_argument("--vae-patience-evals", type=int, default=0)
     p.add_argument("--vae-min-aug-epochs", type=float, default=1.0)
@@ -112,7 +127,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lambda-rollout-q", type=float, default=None)
     p.add_argument("--lambda-intermediate", type=float, default=0.0)
     p.add_argument("--intermediate-weight-gamma", type=float, default=0.0)
-    return p.parse_args()
+    args = p.parse_args()
+    if not 0.0 <= args.ema_decay < 1.0:
+        p.error("--ema-decay must be in [0, 1); use 0 to disable EMA")
+    return args
 
 
 @torch.inference_mode()
@@ -129,7 +147,11 @@ def evaluate_ddim_reasoner(
     total = 0
     sums = {"exact": 0.0, "cell": 0.0, "q": 0.0}
     for raw in iter_group_eval_batches(
-        args.data_dir, args.task, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
+        args.data_dir,
+        args.task,
+        args.eval_batch_size,
+        val_group_ids,
+        aug_count=args.val_aug_count,
     ):
         batch = to_device(raw, device)
         pred_tokens, q_logits = model.sample(
@@ -154,7 +176,11 @@ def evaluate_ddim_reasoner(
 
 
 def ddim_pointwise_loss(
-    model: UnifiedDDIMLatentReasoner, batch, spec, label_smoothing: float = 0.0
+    model: UnifiedDDIMLatentReasoner,
+    batch,
+    spec,
+    label_smoothing: float = 0.0,
+    stablemax: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     with torch.no_grad():
         z_star = model.encode_solution_normalized(
@@ -176,6 +202,7 @@ def ddim_pointwise_loss(
         model.vae.config.output_vocab_size,
         model.vae.config.ignore_index,
         label_smoothing,
+        stablemax,
     )
     with torch.no_grad():
         pred_tokens = logits_to_tokens(logits, spec)
@@ -199,6 +226,7 @@ def train_ddim_reasoner(
     device: torch.device,
     model: UnifiedDDIMLatentReasoner,
     train_group_ids,
+    ema: ModuleEMA | None,
 ) -> int:
     for param in model.vae.parameters():
         param.requires_grad_(False)
@@ -243,13 +271,15 @@ def train_ddim_reasoner(
             epoch_done = step * args.ddim_batch_size / train_group_count
         batch = to_device(raw, device)
         loss, parts = ddim_pointwise_loss(
-            model, batch, spec, args.answer_label_smoothing
+            model, batch, spec, args.answer_label_smoothing, args.stablemax
         )
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.reasoner.parameters(), 1.0)
         set_warmup_lr(opt, args.ddim_lr, step, args.ddim_warmup_steps)
         opt.step()
+        if ema is not None:
+            ema.update(model.reasoner)
         if step == 1 or step % 100 == 0:
             pred_tokens = logits_to_tokens(parts["logits"], spec)
             exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
@@ -271,6 +301,7 @@ def train_rollout(
     model: UnifiedDDIMLatentReasoner,
     train_group_ids,
     val_group_ids,
+    ema: ModuleEMA | None,
 ) -> int:
     total_steps = args.rollout_steps
     train_group_count = max(len(train_group_ids), 1)
@@ -319,7 +350,9 @@ def train_rollout(
     best_val_loss = float("inf")
     spec = get_task_spec(args.task, args.data_dir)
     if val_group_ids.size:
-        init_metrics = evaluate_ddim_reasoner(model, args, device, val_group_ids)
+        init_metrics = evaluate_with_optional_ema(
+            evaluate_ddim_reasoner, model, args, device, val_group_ids, ema
+        )
         best_val_exact = init_metrics["exact"]
         best_val_loss = init_metrics["loss"]
         print(
@@ -343,7 +376,7 @@ def train_rollout(
             epoch_done = step * args.rollout_batch_size / train_group_count
         batch = to_device(raw, device)
         pointwise_loss, pointwise = ddim_pointwise_loss(
-            model, batch, spec, args.answer_label_smoothing
+            model, batch, spec, args.answer_label_smoothing, args.stablemax
         )
 
         roll_out = model.rollout(
@@ -358,6 +391,7 @@ def train_rollout(
             model.vae.config.output_vocab_size,
             model.vae.config.ignore_index,
             args.answer_label_smoothing,
+            args.stablemax,
         )
         intermediate_loss = logits.new_tensor(0.0)
         if args.lambda_intermediate > 0.0:
@@ -371,6 +405,7 @@ def train_rollout(
                             model.vae.config.output_vocab_size,
                             model.vae.config.ignore_index,
                             args.answer_label_smoothing,
+                            args.stablemax,
                         )
                         for mid in intermediate_logits
                     ]
@@ -397,6 +432,8 @@ def train_rollout(
         torch.nn.utils.clip_grad_norm_(model.reasoner.parameters(), 1.0)
         set_warmup_lr(opt, args.rollout_lr, step, args.rollout_warmup_steps)
         opt.step()
+        if ema is not None:
+            ema.update(model.reasoner)
 
         if step == 1 or step % 100 == 0:
             exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
@@ -412,7 +449,9 @@ def train_rollout(
         if val_group_ids.size and (
             step == 1 or step % eval_interval_steps == 0 or step == total_steps
         ):
-            metrics = evaluate_ddim_reasoner(model, args, device, val_group_ids)
+            metrics = evaluate_with_optional_ema(
+                evaluate_ddim_reasoner, model, args, device, val_group_ids, ema
+            )
             tqdm.write(
                 f"stage=rollout_eval step={step} epoch={epoch_done:.2f} R={args.val_R} K={args.val_K} val_exact={metrics['exact']:.4f} val_cell={metrics['cell']:.4f} val_q={metrics['q']:.4f}"
             )
@@ -422,7 +461,8 @@ def train_rollout(
             if is_better:
                 best_val_exact = metrics["exact"]
                 best_val_loss = metrics["loss"]
-                save_ddim_unified(
+                save_with_optional_ema(
+                    save_ddim_unified,
                     best_unified_out,
                     model,
                     {
@@ -433,6 +473,7 @@ def train_rollout(
                         "selection": "max_rollout_exact",
                         "val_metrics": metrics,
                     },
+                    ema,
                 )
                 tqdm.write(f"saved best unified {best_unified_out}")
     return total_steps
@@ -484,6 +525,9 @@ def main() -> None:
         vae, reasoner, schedule=schedule, task=args.task
     ).to(device)
     unified.set_latent_stats(mean, std)
+    ema = make_ema(unified.reasoner, args.ema_decay)
+    if ema is not None:
+        print(f"reasoner_ema decay={ema.decay}")
     param_counts = {
         "vae": parameter_counts(vae),
         "reasoner": parameter_counts(reasoner),
@@ -496,14 +540,15 @@ def main() -> None:
         f"reasoner={param_counts['reasoner']['total']} "
         f"unified={param_counts['unified']['total']}"
     )
-    ddim_steps = train_ddim_reasoner(args, device, unified, train_group_ids)
+    ddim_steps = train_ddim_reasoner(args, device, unified, train_group_ids, ema)
     rollout_requested = args.rollout_steps is not None or args.rollout_epochs > 0
     rollout_steps = (
-        train_rollout(args, device, unified, train_group_ids, val_group_ids)
+        train_rollout(args, device, unified, train_group_ids, val_group_ids, ema)
         if rollout_requested
         else 0
     )
-    save_ddim_unified(
+    save_with_optional_ema(
+        save_ddim_unified,
         args.out,
         unified,
         {
@@ -518,6 +563,7 @@ def main() -> None:
             "val_groups": int(val_group_ids.size),
             "latent_stats_count": stats_count,
         },
+        ema,
     )
     print(f"saved {Path(args.out)}")
 

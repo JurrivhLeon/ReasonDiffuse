@@ -30,6 +30,7 @@ class TaskSpec:
         beta: float,
         dropout: float = 0.0,
         label_smoothing: float = 0.0,
+        stablemax: bool = True,
     ) -> VAEConfig:
         return VAEConfig(
             d_model=d_model,
@@ -39,6 +40,7 @@ class TaskSpec:
             dropout=dropout,
             beta=beta,
             label_smoothing=label_smoothing,
+            stablemax=stablemax,
             seq_len=self.seq_len,
             input_vocab_size=self.input_vocab_size,
             output_vocab_size=self.output_vocab_size,
@@ -102,7 +104,9 @@ def get_task_spec(task: str, data_dir: str | Path) -> TaskSpec:
 
 
 class TaskArrays:
-    def __init__(self, root: str | Path, task: str, split: str = "train", set_name: str = "all"):
+    def __init__(
+        self, root: str | Path, task: str, split: str = "train", set_name: str = "all"
+    ):
         self.root = Path(root)
         self.task = task.lower()
         self.spec = get_task_spec(self.task, self.root)
@@ -112,7 +116,10 @@ class TaskArrays:
         self.labels = np.load(split_dir / f"{set_name}__labels.npy", mmap_mode="r")
         self.puzzle_indices = np.load(split_dir / f"{set_name}__puzzle_indices.npy")
         self.group_indices = np.load(split_dir / f"{set_name}__group_indices.npy")
-        if self.inputs.shape[1] != self.spec.seq_len or self.labels.shape[1] != self.spec.seq_len:
+        if (
+            self.inputs.shape[1] != self.spec.seq_len
+            or self.labels.shape[1] != self.spec.seq_len
+        ):
             raise ValueError(
                 f"Expected {self.task} seq_len={self.spec.seq_len}, got {self.inputs.shape}, {self.labels.shape}"
             )
@@ -132,7 +139,11 @@ class TaskNpyDataset(Dataset):
         limit: int | None = None,
     ):
         self.arrays = TaskArrays(root, task=task, split=split, set_name=set_name)
-        self.limit = min(limit, len(self.arrays.inputs)) if limit is not None else len(self.arrays.inputs)
+        self.limit = (
+            min(limit, len(self.arrays.inputs))
+            if limit is not None
+            else len(self.arrays.inputs)
+        )
 
     def __len__(self) -> int:
         return self.limit
@@ -146,7 +157,9 @@ class TaskNpyDataset(Dataset):
         )
 
 
-def _convert_rows(task: str, inputs: np.ndarray, labels: np.ndarray, indices: np.ndarray) -> dict[str, torch.Tensor]:
+def _convert_rows(
+    task: str, inputs: np.ndarray, labels: np.ndarray, indices: np.ndarray
+) -> dict[str, torch.Tensor]:
     puzzle_raw = torch.from_numpy(np.asarray(inputs[indices], dtype=np.int64).copy())
     label_raw = torch.from_numpy(np.asarray(labels[indices], dtype=np.int64).copy())
     if task == "sudoku":
@@ -168,10 +181,17 @@ def _convert_rows(task: str, inputs: np.ndarray, labels: np.ndarray, indices: np
     }
 
 
-def _collate_dataset_items(items: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+def _collate_dataset_items(
+    items: list[dict[str, torch.Tensor]]
+) -> dict[str, torch.Tensor]:
     return {
         key: torch.cat([item[key] for item in items], dim=0)
-        for key in ("puzzle_tokens", "puzzle_values", "solution_classes", "solution_tokens")
+        for key in (
+            "puzzle_tokens",
+            "puzzle_values",
+            "solution_classes",
+            "solution_tokens",
+        )
     }
 
 
@@ -225,7 +245,10 @@ def iter_group_batches(
             if len(pending) == batch_size:
                 epoch_done = groups_seen / total_groups
                 yield epoch_done, _convert_rows(
-                    arrays.task, arrays.inputs, arrays.labels, np.asarray(pending, dtype=np.int64)
+                    arrays.task,
+                    arrays.inputs,
+                    arrays.labels,
+                    np.asarray(pending, dtype=np.int64),
                 )
                 pending = []
 
@@ -249,10 +272,20 @@ def iter_group_eval_batches(
             puzzle_id = start_puzzle + offset
             indices.append(int(arrays.puzzle_indices[puzzle_id]))
             if len(indices) == batch_size:
-                yield _convert_rows(arrays.task, arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
+                yield _convert_rows(
+                    arrays.task,
+                    arrays.inputs,
+                    arrays.labels,
+                    np.asarray(indices, dtype=np.int64),
+                )
                 indices = []
     if indices:
-        yield _convert_rows(arrays.task, arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
+        yield _convert_rows(
+            arrays.task,
+            arrays.inputs,
+            arrays.labels,
+            np.asarray(indices, dtype=np.int64),
+        )
 
 
 def iter_group_all_example_batches(
@@ -265,16 +298,28 @@ def iter_group_all_example_batches(
     arrays = TaskArrays(data_dir, task=task, split=split)
     indices: list[int] = []
     for group_id in group_ids:
-        for puzzle_id in range(int(arrays.group_indices[group_id]), int(arrays.group_indices[group_id + 1])):
+        for puzzle_id in range(
+            int(arrays.group_indices[group_id]), int(arrays.group_indices[group_id + 1])
+        ):
             start = int(arrays.puzzle_indices[puzzle_id])
             end = int(arrays.puzzle_indices[puzzle_id + 1])
             for row_idx in range(start, end):
                 indices.append(row_idx)
                 if len(indices) == batch_size:
-                    yield _convert_rows(arrays.task, arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
+                    yield _convert_rows(
+                        arrays.task,
+                        arrays.inputs,
+                        arrays.labels,
+                        np.asarray(indices, dtype=np.int64),
+                    )
                     indices = []
     if indices:
-        yield _convert_rows(arrays.task, arrays.inputs, arrays.labels, np.asarray(indices, dtype=np.int64))
+        yield _convert_rows(
+            arrays.task,
+            arrays.inputs,
+            arrays.labels,
+            np.asarray(indices, dtype=np.int64),
+        )
 
 
 def make_loader(
@@ -306,7 +351,9 @@ def to_device(batch: dict[str, torch.Tensor], device: torch.device) -> TaskBatch
     )
 
 
-def exact_and_cell_accuracy(pred_tokens: torch.Tensor, target_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def exact_and_cell_accuracy(
+    pred_tokens: torch.Tensor, target_tokens: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
     correct = pred_tokens.eq(target_tokens)
     return correct.all(dim=1).float().mean(), correct.float().mean()
 
@@ -317,6 +364,7 @@ def answer_ce(
     output_vocab_size: int,
     ignore_index: int = -100,
     label_smoothing: float = 0.0,
+    stablemax: bool = True,
 ) -> torch.Tensor:
     return token_cross_entropy(
         logits,
@@ -324,6 +372,7 @@ def answer_ce(
         output_vocab_size,
         ignore_index,
         label_smoothing,
+        stablemax,
     )
 
 

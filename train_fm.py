@@ -17,6 +17,7 @@ from reasoner_fm import (
     TokenGridVAE,
     UnifiedLatentReasoner,
 )
+from utils.ema import ModuleEMA, make_ema
 from utils.sudoku.checkpoint import load_vae, save_json, save_unified, save_vae
 from utils.task_data import (
     TaskArrays,
@@ -95,6 +96,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vae-heads", type=int, default=4)
     p.add_argument("--vae-dropout", type=float, default=0.0)
     p.add_argument("--vae-label-smoothing", type=float, default=0.0)
+    p.add_argument(
+        "--stablemax",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use StableMax cross entropy for VAE and reasoner answer losses",
+    )
+    p.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.0,
+        help="Reasoner EMA decay for FM/rollout stages; 0 disables EMA, typical values are 0.999 or 0.9999",
+    )
     p.add_argument("--vae-target-val-exact", type=float, default=None)
     p.add_argument(
         "--vae-patience-evals",
@@ -161,7 +174,10 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Weights non-final intermediate CE by normalized (r/R)^gamma; 0 is uniform.",
     )
-    return p.parse_args()
+    args = p.parse_args()
+    if not 0.0 <= args.ema_decay < 1.0:
+        p.error("--ema-decay must be in [0, 1); use 0 to disable EMA")
+    return args
 
 
 def configure_output_paths(args: argparse.Namespace) -> None:
@@ -214,6 +230,46 @@ def best_path(path: str, explicit: str | None = None) -> str:
     return str(p.with_name(f"{p.stem}.best{p.suffix}"))
 
 
+def _ema_target_module(model: torch.nn.Module, ema_module: torch.nn.Module | None):
+    if ema_module is not None:
+        return ema_module
+    return model.reasoner if hasattr(model, "reasoner") else model
+
+
+def evaluate_with_optional_ema(
+    evaluate_fn,
+    model,
+    args,
+    device,
+    val_group_ids,
+    ema: ModuleEMA | None,
+    ema_module: torch.nn.Module | None = None,
+) -> dict[str, float]:
+    if ema is None:
+        return evaluate_fn(model, args, device, val_group_ids)
+    with ema.average_parameters(_ema_target_module(model, ema_module)):
+        return evaluate_fn(model, args, device, val_group_ids)
+
+
+def save_with_optional_ema(
+    save_fn,
+    path,
+    model,
+    extra: dict,
+    ema: ModuleEMA | None,
+    ema_module: torch.nn.Module | None = None,
+    weights_key: str = "reasoner_weights",
+) -> None:
+    extra = dict(extra)
+    if ema is None:
+        extra.update({"ema_decay": 0.0, weights_key: "raw"})
+        save_fn(path, model, extra)
+        return
+    extra.update({"ema_decay": ema.decay, weights_key: "ema"})
+    with ema.average_parameters(_ema_target_module(model, ema_module)):
+        save_fn(path, model, extra)
+
+
 def set_warmup_lr(
     opt: torch.optim.Optimizer, base_lr: float, step: int, warmup_steps: int
 ) -> None:
@@ -247,7 +303,9 @@ def augmented_train_examples(
 def flat_batches(
     data_dir: str, task: str, batch_size: int, total_steps: int, train_limit: int | None
 ):
-    loader = make_loader(data_dir, task, "train", batch_size, shuffle=True, limit=train_limit)
+    loader = make_loader(
+        data_dir, task, "train", batch_size, shuffle=True, limit=train_limit
+    )
     it = iter(loader)
     for step in range(1, total_steps + 1):
         try:
@@ -268,7 +326,11 @@ def evaluate_vae(
     total = 0
     sums = {"loss": 0.0, "recon": 0.0, "kl": 0.0, "exact": 0.0, "cell": 0.0}
     for raw in iter_group_eval_batches(
-        args.data_dir, args.task, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
+        args.data_dir,
+        args.task,
+        args.eval_batch_size,
+        val_group_ids,
+        aug_count=args.val_aug_count,
     ):
         batch = to_device(raw, device)
         out = model(batch.puzzle_tokens, batch.solution_classes)
@@ -301,7 +363,11 @@ def evaluate_reasoner(
     total = 0
     sums = {"exact": 0.0, "cell": 0.0, "q": 0.0}
     for raw in iter_group_eval_batches(
-        args.data_dir, args.task, args.eval_batch_size, val_group_ids, aug_count=args.val_aug_count
+        args.data_dir,
+        args.task,
+        args.eval_batch_size,
+        val_group_ids,
+        aug_count=args.val_aug_count,
     ):
         batch = to_device(raw, device)
         pred_tokens, q_logits = model.sample(
@@ -339,6 +405,7 @@ def train_vae(
             beta=args.vae_kl_beta,
             dropout=args.vae_dropout,
             label_smoothing=args.vae_label_smoothing,
+            stablemax=args.stablemax,
         )
     ).to(device)
     opt = torch.optim.AdamW(
@@ -377,7 +444,11 @@ def train_vae(
         seed=args.seed,
     )
     flat_iter = flat_batches(
-        args.data_dir, args.task, args.vae_batch_size, args.vae_max_steps, args.train_limit
+        args.data_dir,
+        args.task,
+        args.vae_batch_size,
+        args.vae_max_steps,
+        args.train_limit,
     )
     print(
         f"stage=vae max_steps={args.vae_max_steps} sampling={args.sampling} eval_every_epochs={args.eval_every_epochs} min_aug_examples={min_aug_examples} min_early_stop_steps={min_early_stop_steps}"
@@ -505,6 +576,7 @@ def train_reasoner(
     model: UnifiedLatentReasoner,
     train_group_ids,
     val_group_ids,
+    ema: ModuleEMA | None,
 ) -> int:
     for param in model.vae.parameters():
         param.requires_grad_(False)
@@ -536,7 +608,11 @@ def train_reasoner(
         seed=args.seed + 100000,
     )
     flat_iter = flat_batches(
-        args.data_dir, args.task, args.reasoner_batch_size, total_steps, args.train_limit
+        args.data_dir,
+        args.task,
+        args.reasoner_batch_size,
+        total_steps,
+        args.train_limit,
     )
     print(
         f"stage=reasoner total_steps={total_steps} epochs={args.reasoner_epochs} sampling={args.sampling} train_groups={train_group_count}"
@@ -568,9 +644,12 @@ def train_reasoner(
             model.vae.config.output_vocab_size,
             model.vae.config.ignore_index,
             args.answer_label_smoothing,
+            args.stablemax,
         )
         with torch.no_grad():
-            pred_tokens = logits_to_tokens(logits, get_task_spec(args.task, args.data_dir))
+            pred_tokens = logits_to_tokens(
+                logits, get_task_spec(args.task, args.data_dir)
+            )
             q_target = pred_tokens.eq(batch.solution_tokens).all(dim=1).float()
         q_loss = F.binary_cross_entropy_with_logits(out["q_logits"], q_target)
         loss = (
@@ -583,6 +662,8 @@ def train_reasoner(
         torch.nn.utils.clip_grad_norm_(model.reasoner.parameters(), 1.0)
         set_warmup_lr(opt, args.reasoner_lr, step, args.reasoner_warmup_steps)
         opt.step()
+        if ema is not None:
+            ema.update(model.reasoner)
         if step == 1 or step % 100 == 0:
             exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
             progress.set_postfix(
@@ -603,6 +684,7 @@ def train_rollout(
     model: UnifiedLatentReasoner,
     train_group_ids,
     val_group_ids,
+    ema: ModuleEMA | None,
 ) -> int:
     total_steps = args.rollout_steps
     train_group_count = max(len(train_group_ids), 1)
@@ -651,7 +733,9 @@ def train_rollout(
     best_val_exact = -1.0
     best_val_loss = float("inf")
     if val_group_ids.size:
-        init_metrics = evaluate_reasoner(model, args, device, val_group_ids)
+        init_metrics = evaluate_with_optional_ema(
+            evaluate_reasoner, model, args, device, val_group_ids, ema
+        )
         best_val_exact = init_metrics["exact"]
         best_val_loss = init_metrics["loss"]
         print(
@@ -698,6 +782,7 @@ def train_rollout(
             model.vae.config.output_vocab_size,
             model.vae.config.ignore_index,
             args.answer_label_smoothing,
+            args.stablemax,
         )
         intermediate_loss = logits.new_tensor(0.0)
         if args.lambda_intermediate > 0.0:
@@ -711,6 +796,7 @@ def train_rollout(
                             model.vae.config.output_vocab_size,
                             model.vae.config.ignore_index,
                             args.answer_label_smoothing,
+                            args.stablemax,
                         )
                         for mid in intermediate_logits
                     ]
@@ -722,7 +808,9 @@ def train_rollout(
                 weights = weights / weights.sum().clamp_min(1e-12)
                 intermediate_loss = (weights * losses).sum()
         with torch.no_grad():
-            pred_tokens = logits_to_tokens(logits, get_task_spec(args.task, args.data_dir))
+            pred_tokens = logits_to_tokens(
+                logits, get_task_spec(args.task, args.data_dir)
+            )
             q_target = pred_tokens.eq(batch.solution_tokens).all(dim=1).float()
         q_loss = F.binary_cross_entropy_with_logits(roll_out["q_logits"], q_target)
         loss = (
@@ -737,6 +825,8 @@ def train_rollout(
         torch.nn.utils.clip_grad_norm_(model.reasoner.parameters(), 1.0)
         set_warmup_lr(opt, args.rollout_lr, step, args.rollout_warmup_steps)
         opt.step()
+        if ema is not None:
+            ema.update(model.reasoner)
 
         if step == 1 or step % 100 == 0:
             exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
@@ -752,7 +842,9 @@ def train_rollout(
         if val_group_ids.size and (
             step == 1 or step % eval_interval_steps == 0 or step == total_steps
         ):
-            metrics = evaluate_reasoner(model, args, device, val_group_ids)
+            metrics = evaluate_with_optional_ema(
+                evaluate_reasoner, model, args, device, val_group_ids, ema
+            )
             tqdm.write(
                 f"stage=rollout_eval step={step} epoch={epoch_done:.2f} R={args.val_R} K={args.val_K} val_exact={metrics['exact']:.4f} val_cell={metrics['cell']:.4f} val_q={metrics['q']:.4f}"
             )
@@ -762,7 +854,8 @@ def train_rollout(
             if is_better:
                 best_val_exact = metrics["exact"]
                 best_val_loss = metrics["loss"]
-                save_unified(
+                save_with_optional_ema(
+                    save_unified,
                     best_unified_out,
                     model,
                     {
@@ -773,6 +866,7 @@ def train_rollout(
                         "selection": "max_rollout_exact",
                         "val_metrics": metrics,
                     },
+                    ema,
                 )
                 tqdm.write(f"saved best unified {best_unified_out}")
     return total_steps
@@ -817,6 +911,9 @@ def main() -> None:
     ).to(device)
     unified = UnifiedLatentReasoner(vae, reasoner, task=args.task).to(device)
     unified.set_latent_stats(mean, std)
+    ema = make_ema(unified.reasoner, args.ema_decay)
+    if ema is not None:
+        print(f"reasoner_ema decay={ema.decay}")
     param_counts = {
         "vae": parameter_counts(vae),
         "reasoner": parameter_counts(reasoner),
@@ -830,16 +927,17 @@ def main() -> None:
         f"unified={param_counts['unified']['total']}"
     )
     reasoner_steps = train_reasoner(
-        args, device, unified, train_group_ids, val_group_ids
+        args, device, unified, train_group_ids, val_group_ids, ema
     )
     rollout_requested = args.rollout_steps is not None or args.rollout_epochs > 0
     if rollout_requested:
         rollout_steps = train_rollout(
-            args, device, unified, train_group_ids, val_group_ids
+            args, device, unified, train_group_ids, val_group_ids, ema
         )
     else:
         rollout_steps = 0
-    save_unified(
+    save_with_optional_ema(
+        save_unified,
         args.out,
         unified,
         {
@@ -854,6 +952,7 @@ def main() -> None:
             "val_groups": int(val_group_ids.size),
             "latent_stats_count": stats_count,
         },
+        ema,
     )
     print(f"saved {Path(args.out)}")
 
