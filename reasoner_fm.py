@@ -39,12 +39,16 @@ class ReasonerConfig:
     lambda_q: float = 0.1
 
 
-def _stablemax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    logits = logits.float()
-    positive = logits + 1.0
-    negative = 1.0 / (1.0 - logits)
-    weights = torch.where(logits >= 0, positive, negative)
-    return weights / weights.sum(dim=dim, keepdim=True).clamp_min(1e-30)
+def _log_stablemax(
+    logits: torch.Tensor, dim: int = -1, epsilon: float = 1e-30
+) -> torch.Tensor:
+    logits = logits.to(torch.float64).nan_to_num(posinf=1e30, neginf=-1e30)
+    weights = torch.empty_like(logits)
+    negative = logits < 0
+    weights[negative] = 1.0 / (1.0 - logits[negative] + epsilon)
+    weights[~negative] = logits[~negative] + 1.0
+    log_weights = weights.clamp_min(epsilon).log()
+    return log_weights - weights.sum(dim=dim, keepdim=True).clamp_min(epsilon).log()
 
 
 def token_cross_entropy(
@@ -77,7 +81,7 @@ def token_cross_entropy(
     flat_logits = flat_logits[valid]
     flat_targets = flat_targets[valid]
     if stablemax:
-        log_probs = _stablemax(flat_logits, dim=-1).clamp_min(1e-30).log()
+        log_probs = _log_stablemax(flat_logits, dim=-1)
         return -log_probs.gather(1, flat_targets[:, None]).squeeze(1).mean()
 
     log_probs = F.log_softmax(flat_logits, dim=-1)
