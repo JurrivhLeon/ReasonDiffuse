@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -52,6 +53,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--best-out", default=None)
     p.add_argument("--vae-out", default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--gpu-ids",
+        default=None,
+        help="Comma-separated CUDA device ids for DataParallel, e.g. 0,1,2,3. Omit for single-device training.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--sampling", choices=("group", "flat"), default="group")
     p.add_argument(
@@ -208,6 +214,10 @@ def configure_output_paths(args: argparse.Namespace) -> None:
     print(f"vae_out={args.vae_out}")
 
 
+def scalar_mean(value: torch.Tensor) -> torch.Tensor:
+    return value.mean() if value.ndim > 0 else value
+
+
 def parameter_counts(model: torch.nn.Module) -> dict[str, int]:
     return {
         "total": sum(p.numel() for p in model.parameters()),
@@ -228,6 +238,58 @@ def best_path(path: str, explicit: str | None = None) -> str:
         return explicit
     p = Path(path)
     return str(p.with_name(f"{p.stem}.best{p.suffix}"))
+
+
+def parse_gpu_ids(gpu_ids: str | None) -> list[int]:
+    if gpu_ids is None or gpu_ids.strip() == "":
+        return []
+    ids = [int(item) for item in gpu_ids.split(",") if item.strip() != ""]
+    if len(set(ids)) != len(ids):
+        raise ValueError("--gpu-ids contains duplicate device ids")
+    return ids
+
+
+def resolve_device(args: argparse.Namespace) -> tuple[torch.device, list[int]]:
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    if not gpu_ids:
+        return torch.device(args.device), []
+    if not torch.cuda.is_available():
+        raise ValueError("--gpu-ids requires CUDA")
+    available = torch.cuda.device_count()
+    invalid = [idx for idx in gpu_ids if idx < 0 or idx >= available]
+    if invalid:
+        raise ValueError(
+            f"Invalid --gpu-ids {invalid}; visible CUDA device count is {available}"
+        )
+    device = torch.device(f"cuda:{gpu_ids[0]}")
+    if args.device != str(device):
+        print(f"multi_gpu device={device} overrides --device {args.device}")
+        args.device = str(device)
+    return device, gpu_ids
+
+
+def maybe_data_parallel(module: torch.nn.Module, gpu_ids: list[int], name: str):
+    if len(gpu_ids) <= 1:
+        return module
+    print(f"multi_gpu wrapping {name} with DataParallel device_ids={gpu_ids}")
+    return torch.nn.DataParallel(module, device_ids=gpu_ids, output_device=gpu_ids[0])
+
+
+def unwrap_data_parallel(module: torch.nn.Module):
+    return module.module if isinstance(module, torch.nn.DataParallel) else module
+
+
+@contextmanager
+def unwrap_unified_for_save(model):
+    old_vae = model.vae
+    old_reasoner = model.reasoner
+    model.vae = unwrap_data_parallel(old_vae)
+    model.reasoner = unwrap_data_parallel(old_reasoner)
+    try:
+        yield model
+    finally:
+        model.vae = old_vae
+        model.reasoner = old_reasoner
 
 
 def _ema_target_module(model: torch.nn.Module, ema_module: torch.nn.Module | None):
@@ -263,11 +325,13 @@ def save_with_optional_ema(
     extra = dict(extra)
     if ema is None:
         extra.update({"ema_decay": 0.0, weights_key: "raw"})
-        save_fn(path, model, extra)
+        with unwrap_unified_for_save(model) as save_model:
+            save_fn(path, save_model, extra)
         return
     extra.update({"ema_decay": ema.decay, weights_key: "ema"})
     with ema.average_parameters(_ema_target_module(model, ema_module)):
-        save_fn(path, model, extra)
+        with unwrap_unified_for_save(model) as save_model:
+            save_fn(path, save_model, extra)
 
 
 def set_warmup_lr(
@@ -338,9 +402,9 @@ def evaluate_vae(
         exact, cell = exact_and_cell_accuracy(pred, batch.solution_tokens)
         bsz = batch.puzzle_tokens.shape[0]
         total += bsz
-        sums["loss"] += out["loss"].item() * bsz
-        sums["recon"] += out["recon"].item() * bsz
-        sums["kl"] += out["kl"].item() * bsz
+        sums["loss"] += scalar_mean(out["loss"]).item() * bsz
+        sums["recon"] += scalar_mean(out["recon"]).item() * bsz
+        sums["kl"] += scalar_mean(out["kl"]).item() * bsz
         sums["exact"] += exact.item() * bsz
         sums["cell"] += cell.item() * bsz
     if was_training:
@@ -393,7 +457,11 @@ def evaluate_reasoner(
 
 
 def train_vae(
-    args: argparse.Namespace, device: torch.device, train_group_ids, val_group_ids
+    args: argparse.Namespace,
+    device: torch.device,
+    train_group_ids,
+    val_group_ids,
+    gpu_ids: list[int] | None = None,
 ) -> TokenGridVAE:
     spec = get_task_spec(args.task, args.data_dir)
     model = spec.make_vae(
@@ -408,6 +476,7 @@ def train_vae(
             stablemax=args.stablemax,
         )
     ).to(device)
+    model = maybe_data_parallel(model, gpu_ids or [], "vae")
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=args.vae_lr,
@@ -464,8 +533,11 @@ def train_vae(
             epoch_done = step * args.vae_batch_size / train_group_count
         batch = to_device(raw, device)
         out = model(batch.puzzle_tokens, batch.solution_classes)
+        loss = scalar_mean(out["loss"])
+        recon = scalar_mean(out["recon"])
+        kl = scalar_mean(out["kl"])
         opt.zero_grad(set_to_none=True)
-        out["loss"].backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         set_warmup_lr(opt, args.vae_lr, step, args.vae_warmup_steps)
         opt.step()
@@ -474,12 +546,12 @@ def train_vae(
             exact, cell = exact_and_cell_accuracy(pred, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}",
-                loss=f"{out['loss'].item():.4f}",
+                loss=f"{loss.item():.4f}",
                 exact=f"{exact.item():.4f}",
                 cell=f"{cell.item():.4f}",
             )
             tqdm.write(
-                f"stage=vae step={step} epoch={epoch_done:.2f} loss={out['loss'].item():.4f} recon={out['recon'].item():.4f} kl={out['kl'].item():.4f} exact={exact.item():.4f} cell={cell.item():.4f}"
+                f"stage=vae step={step} epoch={epoch_done:.2f} loss={loss.item():.4f} recon={recon.item():.4f} kl={kl.item():.4f} exact={exact.item():.4f} cell={cell.item():.4f}"
             )
         if val_group_ids.size and (
             step == 1 or step % eval_interval_steps == 0 or step == args.vae_max_steps
@@ -498,7 +570,7 @@ def train_vae(
                 if best_vae_out is not None:
                     save_vae(
                         best_vae_out,
-                        model,
+                        unwrap_data_parallel(model),
                         {
                             "steps": step,
                             "selection": "max_exact_then_min_recon",
@@ -533,7 +605,7 @@ def train_vae(
                     f"early stop VAE: no validation improvement for {stale_evals} evals"
                 )
                 break
-    return model
+    return unwrap_data_parallel(model)
 
 
 @torch.inference_mode()
@@ -617,7 +689,7 @@ def train_reasoner(
     print(
         f"stage=reasoner total_steps={total_steps} epochs={args.reasoner_epochs} sampling={args.sampling} train_groups={train_group_count}"
     )
-    cfg = model.reasoner.config
+    cfg = unwrap_data_parallel(model.reasoner).config
     progress = tqdm(range(1, total_steps + 1), desc="reasoner", total=total_steps)
     for step in progress:
         if args.sampling == "group":
@@ -641,8 +713,8 @@ def train_reasoner(
         answer_loss = answer_ce(
             logits,
             batch.solution_classes,
-            model.vae.config.output_vocab_size,
-            model.vae.config.ignore_index,
+            unwrap_data_parallel(model.vae).config.output_vocab_size,
+            unwrap_data_parallel(model.vae).config.ignore_index,
             args.answer_label_smoothing,
             args.stablemax,
         )
@@ -779,8 +851,8 @@ def train_rollout(
         rollout_loss = answer_ce(
             logits,
             batch.solution_classes,
-            model.vae.config.output_vocab_size,
-            model.vae.config.ignore_index,
+            unwrap_data_parallel(model.vae).config.output_vocab_size,
+            unwrap_data_parallel(model.vae).config.ignore_index,
             args.answer_label_smoothing,
             args.stablemax,
         )
@@ -793,8 +865,8 @@ def train_rollout(
                         answer_ce(
                             mid,
                             batch.solution_classes,
-                            model.vae.config.output_vocab_size,
-                            model.vae.config.ignore_index,
+                            unwrap_data_parallel(model.vae).config.output_vocab_size,
+                            unwrap_data_parallel(model.vae).config.ignore_index,
                             args.answer_label_smoothing,
                             args.stablemax,
                         )
@@ -875,7 +947,7 @@ def train_rollout(
 def main() -> None:
     args = parse_args()
     configure_output_paths(args)
-    device = torch.device(args.device)
+    device, gpu_ids = resolve_device(args)
     train_group_ids, val_group_ids = split_group_ids(
         args.data_dir,
         args.task,
@@ -886,7 +958,7 @@ def main() -> None:
     print(
         f"groups train={train_group_ids.size} val={val_group_ids.size} sampling={args.sampling}"
     )
-    vae = train_vae(args, device, train_group_ids, val_group_ids)
+    vae = train_vae(args, device, train_group_ids, val_group_ids, gpu_ids)
     best_vae_out = best_path(args.vae_out) if args.vae_out is not None else None
     if best_vae_out is not None and Path(best_vae_out).exists():
         vae, best_vae_ckpt = load_vae(best_vae_out, device)
@@ -910,13 +982,14 @@ def main() -> None:
         )
     ).to(device)
     unified = UnifiedLatentReasoner(vae, reasoner, task=args.task).to(device)
+    unified.reasoner = maybe_data_parallel(unified.reasoner, gpu_ids, "reasoner")
     unified.set_latent_stats(mean, std)
     ema = make_ema(unified.reasoner, args.ema_decay)
     if ema is not None:
         print(f"reasoner_ema decay={ema.decay}")
     param_counts = {
         "vae": parameter_counts(vae),
-        "reasoner": parameter_counts(reasoner),
+        "reasoner": parameter_counts(unwrap_data_parallel(reasoner)),
         "unified": parameter_counts(unified),
     }
     update_config_json(args, {"parameter_counts": param_counts})

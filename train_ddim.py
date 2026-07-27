@@ -33,9 +33,12 @@ from train_fm import (
     configure_output_paths,
     evaluate_with_optional_ema,
     flat_batches,
+    maybe_data_parallel,
     parameter_counts,
+    resolve_device,
     save_with_optional_ema,
     set_warmup_lr,
+    unwrap_data_parallel,
     train_vae,
     update_config_json,
 )
@@ -51,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--best-out", default=None)
     p.add_argument("--vae-out", default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--gpu-ids",
+        default=None,
+        help="Comma-separated CUDA device ids for DataParallel, e.g. 0,1,2,3. Omit for single-device training.",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--sampling", choices=("group", "flat"), default="group")
     p.add_argument("--train-limit", type=int, default=None)
@@ -199,8 +207,8 @@ def ddim_pointwise_loss(
     answer_loss = answer_ce(
         logits,
         batch.solution_classes,
-        model.vae.config.output_vocab_size,
-        model.vae.config.ignore_index,
+        unwrap_data_parallel(model.vae).config.output_vocab_size,
+        unwrap_data_parallel(model.vae).config.ignore_index,
         label_smoothing,
         stablemax,
     )
@@ -209,9 +217,9 @@ def ddim_pointwise_loss(
         q_target = pred_tokens.eq(batch.solution_tokens).all(dim=1).float()
     q_loss = F.binary_cross_entropy_with_logits(out["q_logits"], q_target)
     return (
-        model.reasoner.config.lambda_x0 * x0_loss
-        + model.reasoner.config.lambda_answer * answer_loss
-        + model.reasoner.config.lambda_q * q_loss,
+        unwrap_data_parallel(model.reasoner).config.lambda_x0 * x0_loss
+        + unwrap_data_parallel(model.reasoner).config.lambda_answer * answer_loss
+        + unwrap_data_parallel(model.reasoner).config.lambda_q * q_loss,
         {
             "x0": x0_loss,
             "ce": answer_loss,
@@ -388,8 +396,8 @@ def train_rollout(
         rollout_loss = answer_ce(
             logits,
             batch.solution_classes,
-            model.vae.config.output_vocab_size,
-            model.vae.config.ignore_index,
+            unwrap_data_parallel(model.vae).config.output_vocab_size,
+            unwrap_data_parallel(model.vae).config.ignore_index,
             args.answer_label_smoothing,
             args.stablemax,
         )
@@ -402,8 +410,8 @@ def train_rollout(
                         answer_ce(
                             mid,
                             batch.solution_classes,
-                            model.vae.config.output_vocab_size,
-                            model.vae.config.ignore_index,
+                            unwrap_data_parallel(model.vae).config.output_vocab_size,
+                            unwrap_data_parallel(model.vae).config.ignore_index,
                             args.answer_label_smoothing,
                             args.stablemax,
                         )
@@ -482,7 +490,7 @@ def train_rollout(
 def main() -> None:
     args = parse_args()
     configure_output_paths(args)
-    device = torch.device(args.device)
+    device, gpu_ids = resolve_device(args)
     train_group_ids, val_group_ids = split_group_ids(
         args.data_dir,
         args.task,
@@ -493,7 +501,7 @@ def main() -> None:
     print(
         f"groups train={train_group_ids.size} val={val_group_ids.size} sampling={args.sampling}"
     )
-    vae = train_vae(args, device, train_group_ids, val_group_ids)
+    vae = train_vae(args, device, train_group_ids, val_group_ids, gpu_ids)
     best_vae_out = best_path(args.vae_out) if args.vae_out is not None else None
     if best_vae_out is not None and Path(best_vae_out).exists():
         vae, _ = load_vae(best_vae_out, device)
@@ -524,13 +532,14 @@ def main() -> None:
     unified = UnifiedDDIMLatentReasoner(
         vae, reasoner, schedule=schedule, task=args.task
     ).to(device)
+    unified.reasoner = maybe_data_parallel(unified.reasoner, gpu_ids, "reasoner")
     unified.set_latent_stats(mean, std)
     ema = make_ema(unified.reasoner, args.ema_decay)
     if ema is not None:
         print(f"reasoner_ema decay={ema.decay}")
     param_counts = {
         "vae": parameter_counts(vae),
-        "reasoner": parameter_counts(reasoner),
+        "reasoner": parameter_counts(unwrap_data_parallel(reasoner)),
         "unified": parameter_counts(unified),
     }
     update_config_json(args, {"parameter_counts": param_counts})
