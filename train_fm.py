@@ -4,12 +4,15 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 from reasoner_fm import (
@@ -54,9 +57,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vae-out", default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument(
-        "--gpu-ids",
-        default=None,
-        help="Comma-separated CUDA device ids for DataParallel, e.g. 0,1,2,3. Omit for single-device training.",
+        "--ddp",
+        action="store_true",
+        help="Enable DistributedDataParallel. Launch with torchrun; one process per GPU.",
+    )
+    p.add_argument(
+        "--ddp-find-unused-parameters",
+        action="store_true",
+        help="Pass find_unused_parameters=True to DistributedDataParallel.",
+    )
+    p.add_argument(
+        "--ddp-batch-size-mode",
+        choices=("global", "per-rank"),
+        default="global",
+        help="For DDP, treat configured batch sizes as global totals split across ranks, or as per-rank sizes.",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--sampling", choices=("group", "flat"), default="group")
@@ -186,32 +200,97 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def is_dist() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist() else 0
+
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist() else 1
+
+
+def is_rank_zero() -> bool:
+    return get_rank() == 0
+
+
+def rank_print(*args, **kwargs) -> None:
+    if is_rank_zero():
+        print(*args, **kwargs)
+
+
+def ddp_barrier() -> None:
+    if is_dist():
+        dist.barrier()
+
+
+def init_distributed(args: argparse.Namespace) -> tuple[int, int, int]:
+    if not args.ddp:
+        return 0, 1, 0
+    if not torch.cuda.is_available():
+        raise ValueError("--ddp requires CUDA")
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+    torch.cuda.set_device(local_rank)
+    args.device = f"cuda:{local_rank}"
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed() -> None:
+    if is_dist():
+        dist.destroy_process_group()
+
+
 def configure_output_paths(args: argparse.Namespace) -> None:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.run_dir is not None:
-        run_dir = Path(args.run_dir)
+    if is_rank_zero():
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.run_dir is not None:
+            run_dir = Path(args.run_dir)
+        else:
+            output_dir = (
+                Path(args.output_dir)
+                if args.output_dir is not None
+                else Path("checkpoints") / args.task
+            )
+            run_dir = output_dir / f"run_{timestamp}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        args.run_dir = str(run_dir)
+        if args.out is None:
+            args.out = str(run_dir / "unified.pt")
+        if args.best_out is None:
+            args.best_out = str(run_dir / "unified.best.pt")
+        if args.vae_out is None:
+            args.vae_out = str(run_dir / "vae.pt")
+        args.config_out = str(run_dir / "config.json")
+        save_json(args.config_out, vars(args))
+        payload = {
+            "run_dir": args.run_dir,
+            "out": args.out,
+            "best_out": args.best_out,
+            "vae_out": args.vae_out,
+            "config_out": args.config_out,
+        }
     else:
-        output_dir = (
-            Path(args.output_dir)
-            if args.output_dir is not None
-            else Path("checkpoints") / args.task
-        )
-        run_dir = output_dir / f"run_{timestamp}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    args.run_dir = str(run_dir)
-    if args.out is None:
-        args.out = str(run_dir / "unified.pt")
-    if args.best_out is None:
-        args.best_out = str(run_dir / "unified.best.pt")
-    if args.vae_out is None:
-        args.vae_out = str(run_dir / "vae.pt")
-    args.config_out = str(run_dir / "config.json")
-    save_json(args.config_out, vars(args))
-    print(f"run_dir={args.run_dir}")
-    print(f"config_out={args.config_out}")
-    print(f"out={args.out}")
-    print(f"best_out={args.best_out}")
-    print(f"vae_out={args.vae_out}")
+        payload = None
+    if is_dist():
+        obj = [payload]
+        dist.broadcast_object_list(obj, src=0)
+        payload = obj[0]
+        args.run_dir = payload["run_dir"]
+        args.out = payload["out"]
+        args.best_out = payload["best_out"]
+        args.vae_out = payload["vae_out"]
+        args.config_out = payload["config_out"]
+    rank_print(f"run_dir={args.run_dir}")
+    rank_print(f"config_out={args.config_out}")
+    rank_print(f"out={args.out}")
+    rank_print(f"best_out={args.best_out}")
+    rank_print(f"vae_out={args.vae_out}")
 
 
 def scalar_mean(value: torch.Tensor) -> torch.Tensor:
@@ -240,51 +319,44 @@ def best_path(path: str, explicit: str | None = None) -> str:
     return str(p.with_name(f"{p.stem}.best{p.suffix}"))
 
 
-def parse_gpu_ids(gpu_ids: str | None) -> list[int]:
-    if gpu_ids is None or gpu_ids.strip() == "":
-        return []
-    ids = [int(item) for item in gpu_ids.split(",") if item.strip() != ""]
-    if len(set(ids)) != len(ids):
-        raise ValueError("--gpu-ids contains duplicate device ids")
-    return ids
+def resolve_device(args: argparse.Namespace) -> torch.device:
+    return torch.device(args.device)
 
 
-def resolve_device(args: argparse.Namespace) -> tuple[torch.device, list[int]]:
-    gpu_ids = parse_gpu_ids(args.gpu_ids)
-    if not gpu_ids:
-        return torch.device(args.device), []
-    if not torch.cuda.is_available():
-        raise ValueError("--gpu-ids requires CUDA")
-    available = torch.cuda.device_count()
-    invalid = [idx for idx in gpu_ids if idx < 0 or idx >= available]
-    if invalid:
-        raise ValueError(
-            f"Invalid --gpu-ids {invalid}; visible CUDA device count is {available}"
-        )
-    device = torch.device(f"cuda:{gpu_ids[0]}")
-    if args.device != str(device):
-        print(f"multi_gpu device={device} overrides --device {args.device}")
-        args.device = str(device)
-    return device, gpu_ids
-
-
-def maybe_data_parallel(module: torch.nn.Module, gpu_ids: list[int], name: str):
-    if len(gpu_ids) <= 1:
+def maybe_ddp(module: torch.nn.Module, args: argparse.Namespace, name: str):
+    if not getattr(args, "ddp", False):
         return module
-    print(f"multi_gpu wrapping {name} with DataParallel device_ids={gpu_ids}")
-    return torch.nn.DataParallel(module, device_ids=gpu_ids, output_device=gpu_ids[0])
+    rank_print(f"ddp wrapping {name} world_size={get_world_size()}")
+    return DistributedDataParallel(
+        module,
+        device_ids=[torch.cuda.current_device()],
+        output_device=torch.cuda.current_device(),
+        find_unused_parameters=args.ddp_find_unused_parameters,
+        broadcast_buffers=False,
+    )
 
 
-def unwrap_data_parallel(module: torch.nn.Module):
-    return module.module if isinstance(module, torch.nn.DataParallel) else module
+def unwrap_parallel(module: torch.nn.Module):
+    if isinstance(module, DistributedDataParallel):
+        return module.module
+    return module
+
+
+def local_batch_size(args: argparse.Namespace, batch_size: int) -> int:
+    if (
+        not getattr(args, "ddp", False)
+        or getattr(args, "ddp_batch_size_mode", "global") == "per-rank"
+    ):
+        return batch_size
+    return max(1, math.ceil(batch_size / get_world_size()))
 
 
 @contextmanager
 def unwrap_unified_for_save(model):
     old_vae = model.vae
     old_reasoner = model.reasoner
-    model.vae = unwrap_data_parallel(old_vae)
-    model.reasoner = unwrap_data_parallel(old_reasoner)
+    model.vae = unwrap_parallel(old_vae)
+    model.reasoner = unwrap_parallel(old_reasoner)
     try:
         yield model
     finally:
@@ -294,8 +366,12 @@ def unwrap_unified_for_save(model):
 
 def _ema_target_module(model: torch.nn.Module, ema_module: torch.nn.Module | None):
     if ema_module is not None:
-        return ema_module
-    return model.reasoner if hasattr(model, "reasoner") else model
+        return unwrap_parallel(ema_module)
+    return (
+        unwrap_parallel(model.reasoner)
+        if hasattr(model, "reasoner")
+        else unwrap_parallel(model)
+    )
 
 
 def evaluate_with_optional_ema(
@@ -308,9 +384,11 @@ def evaluate_with_optional_ema(
     ema_module: torch.nn.Module | None = None,
 ) -> dict[str, float]:
     if ema is None:
-        return evaluate_fn(model, args, device, val_group_ids)
+        with unwrap_unified_for_save(model) as eval_model:
+            return evaluate_fn(eval_model, args, device, val_group_ids)
     with ema.average_parameters(_ema_target_module(model, ema_module)):
-        return evaluate_fn(model, args, device, val_group_ids)
+        with unwrap_unified_for_save(model) as eval_model:
+            return evaluate_fn(eval_model, args, device, val_group_ids)
 
 
 def save_with_optional_ema(
@@ -322,6 +400,8 @@ def save_with_optional_ema(
     ema_module: torch.nn.Module | None = None,
     weights_key: str = "reasoner_weights",
 ) -> None:
+    if not is_rank_zero():
+        return
     extra = dict(extra)
     if ema is None:
         extra.update({"ema_decay": 0.0, weights_key: "raw"})
@@ -457,11 +537,7 @@ def evaluate_reasoner(
 
 
 def train_vae(
-    args: argparse.Namespace,
-    device: torch.device,
-    train_group_ids,
-    val_group_ids,
-    gpu_ids: list[int] | None = None,
+    args: argparse.Namespace, device: torch.device, train_group_ids, val_group_ids
 ) -> TokenGridVAE:
     spec = get_task_spec(args.task, args.data_dir)
     model = spec.make_vae(
@@ -476,7 +552,7 @@ def train_vae(
             stablemax=args.stablemax,
         )
     ).to(device)
-    model = maybe_data_parallel(model, gpu_ids or [], "vae")
+    model = maybe_ddp(model, args, "vae")
     opt = torch.optim.AdamW(
         model.parameters(),
         lr=args.vae_lr,
@@ -489,6 +565,7 @@ def train_vae(
     stale_evals = 0
     best_vae_out = best_path(args.vae_out) if args.vae_out is not None else None
     train_group_count = max(len(train_group_ids), 1)
+    vae_batch_size = local_batch_size(args, args.vae_batch_size)
     min_aug_examples = augmented_train_examples(
         args.data_dir,
         args.task,
@@ -499,7 +576,7 @@ def train_vae(
         args.vae_min_aug_epochs * min_aug_examples / args.vae_batch_size
     )
     epochs_needed = (
-        math.ceil(args.vae_max_steps * args.vae_batch_size / train_group_count) + 1
+        math.ceil(args.vae_max_steps * vae_batch_size / train_group_count) + 1
     )
     eval_interval_steps = max(
         1, math.ceil(args.eval_every_epochs * train_group_count / args.vae_batch_size)
@@ -507,23 +584,26 @@ def train_vae(
     group_iter = iter_group_batches(
         args.data_dir,
         args.task,
-        args.vae_batch_size,
+        vae_batch_size,
         train_group_ids,
         epochs_needed,
-        seed=args.seed,
+        seed=args.seed + get_rank(),
     )
     flat_iter = flat_batches(
         args.data_dir,
         args.task,
-        args.vae_batch_size,
+        vae_batch_size,
         args.vae_max_steps,
         args.train_limit,
     )
-    print(
-        f"stage=vae max_steps={args.vae_max_steps} sampling={args.sampling} eval_every_epochs={args.eval_every_epochs} min_aug_examples={min_aug_examples} min_early_stop_steps={min_early_stop_steps}"
+    rank_print(
+        f"stage=vae max_steps={args.vae_max_steps} sampling={args.sampling} batch_size={args.vae_batch_size} local_batch_size={vae_batch_size} eval_every_epochs={args.eval_every_epochs} min_aug_examples={min_aug_examples} min_early_stop_steps={min_early_stop_steps}"
     )
     progress = tqdm(
-        range(1, args.vae_max_steps + 1), desc="vae", total=args.vae_max_steps
+        range(1, args.vae_max_steps + 1),
+        desc="vae",
+        total=args.vae_max_steps,
+        disable=not is_rank_zero(),
     )
     for step in progress:
         if args.sampling == "group":
@@ -541,7 +621,7 @@ def train_vae(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         set_warmup_lr(opt, args.vae_lr, step, args.vae_warmup_steps)
         opt.step()
-        if step == 1 or step % 100 == 0:
+        if is_rank_zero() and (step == 1 or step % 100 == 0):
             pred = logits_to_tokens(out["logits"], spec)
             exact, cell = exact_and_cell_accuracy(pred, batch.solution_tokens)
             progress.set_postfix(
@@ -553,59 +633,69 @@ def train_vae(
             tqdm.write(
                 f"stage=vae step={step} epoch={epoch_done:.2f} loss={loss.item():.4f} recon={recon.item():.4f} kl={kl.item():.4f} exact={exact.item():.4f} cell={cell.item():.4f}"
             )
+        stop_training = False
         if val_group_ids.size and (
             step == 1 or step % eval_interval_steps == 0 or step == args.vae_max_steps
         ):
-            metrics = evaluate_vae(model, args, device, val_group_ids)
-            tqdm.write(
-                f"stage=vae_eval step={step} epoch={epoch_done:.2f} val_loss={metrics['loss']:.4f} val_recon={metrics['recon']:.4f} val_exact={metrics['exact']:.4f} val_cell={metrics['cell']:.4f}"
-            )
-            is_better = (metrics["exact"] > best_val_exact) or (
-                metrics["exact"] == best_val_exact and metrics["recon"] < best_val_recon
-            )
-            if is_better:
-                best_val_exact = metrics["exact"]
-                best_val_recon = metrics["recon"]
-                stale_evals = 0
-                if best_vae_out is not None:
-                    save_vae(
-                        best_vae_out,
-                        unwrap_data_parallel(model),
-                        {
-                            "steps": step,
-                            "selection": "max_exact_then_min_recon",
-                            "val_metrics": metrics,
-                        },
+            if is_rank_zero():
+                eval_model = unwrap_parallel(model)
+                metrics = evaluate_vae(eval_model, args, device, val_group_ids)
+                tqdm.write(
+                    f"stage=vae_eval step={step} epoch={epoch_done:.2f} val_loss={metrics['loss']:.4f} val_recon={metrics['recon']:.4f} val_exact={metrics['exact']:.4f} val_cell={metrics['cell']:.4f}"
+                )
+                is_better = (metrics["exact"] > best_val_exact) or (
+                    metrics["exact"] == best_val_exact
+                    and metrics["recon"] < best_val_recon
+                )
+                if is_better:
+                    best_val_exact = metrics["exact"]
+                    best_val_recon = metrics["recon"]
+                    stale_evals = 0
+                    if best_vae_out is not None:
+                        save_vae(
+                            best_vae_out,
+                            eval_model,
+                            {
+                                "steps": step,
+                                "selection": "max_exact_then_min_recon",
+                                "val_metrics": metrics,
+                            },
+                        )
+                        tqdm.write(f"saved best VAE {best_vae_out}")
+                else:
+                    stale_evals += 1
+                early_stop_allowed = step >= min_early_stop_steps
+                if not early_stop_allowed and (
+                    args.vae_target_val_exact is not None or args.vae_patience_evals > 0
+                ):
+                    tqdm.write(
+                        f"VAE early stop disabled until step {min_early_stop_steps} ({args.vae_min_aug_epochs:g} augmented epoch floor)"
                     )
-                    tqdm.write(f"saved best VAE {best_vae_out}")
-            else:
-                stale_evals += 1
-            early_stop_allowed = step >= min_early_stop_steps
-            if not early_stop_allowed and (
-                args.vae_target_val_exact is not None or args.vae_patience_evals > 0
-            ):
-                tqdm.write(
-                    f"VAE early stop disabled until step {min_early_stop_steps} ({args.vae_min_aug_epochs:g} augmented epoch floor)"
-                )
-            if (
-                early_stop_allowed
-                and args.vae_target_val_exact is not None
-                and metrics["exact"] >= args.vae_target_val_exact
-            ):
-                tqdm.write(
-                    f"early stop VAE: val_exact {metrics['exact']:.4f} >= target {args.vae_target_val_exact:.4f}"
-                )
+                if (
+                    early_stop_allowed
+                    and args.vae_target_val_exact is not None
+                    and metrics["exact"] >= args.vae_target_val_exact
+                ):
+                    tqdm.write(
+                        f"early stop VAE: val_exact {metrics['exact']:.4f} >= target {args.vae_target_val_exact:.4f}"
+                    )
+                    stop_training = True
+                if (
+                    early_stop_allowed
+                    and args.vae_patience_evals > 0
+                    and stale_evals >= args.vae_patience_evals
+                ):
+                    tqdm.write(
+                        f"early stop VAE: no validation improvement for {stale_evals} evals"
+                    )
+                    stop_training = True
+            if is_dist():
+                flag = torch.tensor(int(stop_training), device=device)
+                dist.broadcast(flag, src=0)
+                stop_training = bool(flag.item())
+            if stop_training:
                 break
-            if (
-                early_stop_allowed
-                and args.vae_patience_evals > 0
-                and stale_evals >= args.vae_patience_evals
-            ):
-                tqdm.write(
-                    f"early stop VAE: no validation improvement for {stale_evals} evals"
-                )
-                break
-    return unwrap_data_parallel(model)
+    return unwrap_parallel(model)
 
 
 @torch.inference_mode()
@@ -616,12 +706,13 @@ def compute_latent_stats(
     count = 0
     total = None
     total_sq = None
-    print("stage=stats")
+    rank_print("stage=stats")
     for raw in tqdm(
         iter_group_all_example_batches(
             args.data_dir, args.task, args.stats_batch_size, train_group_ids
         ),
         desc="stats",
+        disable=not is_rank_zero(),
     ):
         batch = to_device(raw, device)
         mu, _ = vae.encode(batch.puzzle_tokens, batch.solution_classes)
@@ -636,7 +727,7 @@ def compute_latent_stats(
     mean = total / count
     var = (total_sq / count - mean.square()).clamp_min(1e-6)
     std = var.sqrt()
-    print(
+    rank_print(
         f"stage=stats count={count} mean_abs={mean.abs().mean().item():.4f} std_mean={std.mean().item():.4f}"
     )
     return mean, std, count
@@ -661,6 +752,7 @@ def train_reasoner(
         weight_decay=args.reasoner_weight_decay,
     )
     train_group_count = max(len(train_group_ids), 1)
+    reasoner_batch_size = local_batch_size(args, args.reasoner_batch_size)
     total_steps = (
         args.reasoner_steps
         if args.reasoner_steps is not None
@@ -668,29 +760,32 @@ def train_reasoner(
             args.reasoner_epochs * train_group_count / args.reasoner_batch_size
         )
     )
-    epochs_needed = (
-        math.ceil(total_steps * args.reasoner_batch_size / train_group_count) + 1
-    )
+    epochs_needed = math.ceil(total_steps * reasoner_batch_size / train_group_count) + 1
     group_iter = iter_group_batches(
         args.data_dir,
         args.task,
-        args.reasoner_batch_size,
+        reasoner_batch_size,
         train_group_ids,
         epochs_needed,
-        seed=args.seed + 100000,
+        seed=args.seed + 100000 + get_rank(),
     )
     flat_iter = flat_batches(
         args.data_dir,
         args.task,
-        args.reasoner_batch_size,
+        reasoner_batch_size,
         total_steps,
         args.train_limit,
     )
-    print(
-        f"stage=reasoner total_steps={total_steps} epochs={args.reasoner_epochs} sampling={args.sampling} train_groups={train_group_count}"
+    rank_print(
+        f"stage=reasoner total_steps={total_steps} epochs={args.reasoner_epochs} sampling={args.sampling} batch_size={args.reasoner_batch_size} local_batch_size={reasoner_batch_size} train_groups={train_group_count}"
     )
-    cfg = unwrap_data_parallel(model.reasoner).config
-    progress = tqdm(range(1, total_steps + 1), desc="reasoner", total=total_steps)
+    cfg = unwrap_parallel(model.reasoner).config
+    progress = tqdm(
+        range(1, total_steps + 1),
+        desc="reasoner",
+        total=total_steps,
+        disable=not is_rank_zero(),
+    )
     for step in progress:
         if args.sampling == "group":
             epoch_done, raw = next(group_iter)
@@ -713,8 +808,8 @@ def train_reasoner(
         answer_loss = answer_ce(
             logits,
             batch.solution_classes,
-            unwrap_data_parallel(model.vae).config.output_vocab_size,
-            unwrap_data_parallel(model.vae).config.ignore_index,
+            unwrap_parallel(model.vae).config.output_vocab_size,
+            unwrap_parallel(model.vae).config.ignore_index,
             args.answer_label_smoothing,
             args.stablemax,
         )
@@ -735,8 +830,8 @@ def train_reasoner(
         set_warmup_lr(opt, args.reasoner_lr, step, args.reasoner_warmup_steps)
         opt.step()
         if ema is not None:
-            ema.update(model.reasoner)
-        if step == 1 or step % 100 == 0:
+            ema.update(unwrap_parallel(model.reasoner))
+        if is_rank_zero() and (step == 1 or step % 100 == 0):
             exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}/{args.reasoner_epochs}",
@@ -765,7 +860,7 @@ def train_rollout(
             args.rollout_epochs * train_group_count / args.rollout_batch_size
         )
     if total_steps <= 0:
-        print("stage=rollout skipped")
+        rank_print("stage=rollout skipped")
         return 0
 
     for param in model.vae.parameters():
@@ -779,9 +874,8 @@ def train_rollout(
         betas=(args.rollout_beta1, args.rollout_beta2),
         weight_decay=args.rollout_weight_decay,
     )
-    epochs_needed = (
-        math.ceil(total_steps * args.rollout_batch_size / train_group_count) + 1
-    )
+    rollout_batch_size = local_batch_size(args, args.rollout_batch_size)
+    epochs_needed = math.ceil(total_steps * rollout_batch_size / train_group_count) + 1
     eval_interval_steps = max(
         1,
         math.ceil(args.eval_every_epochs * train_group_count / args.rollout_batch_size),
@@ -789,13 +883,13 @@ def train_rollout(
     group_iter = iter_group_batches(
         args.data_dir,
         args.task,
-        args.rollout_batch_size,
+        rollout_batch_size,
         train_group_ids,
         epochs_needed,
-        seed=args.seed + 200000,
+        seed=args.seed + 200000 + get_rank(),
     )
     flat_iter = flat_batches(
-        args.data_dir, args.task, args.rollout_batch_size, total_steps, args.train_limit
+        args.data_dir, args.task, rollout_batch_size, total_steps, args.train_limit
     )
     lambda_fm = (
         args.lambda_fm if args.lambda_rollout_fm is None else args.lambda_rollout_fm
@@ -805,24 +899,31 @@ def train_rollout(
     best_val_exact = -1.0
     best_val_loss = float("inf")
     if val_group_ids.size:
-        init_metrics = evaluate_with_optional_ema(
-            evaluate_reasoner, model, args, device, val_group_ids, ema
-        )
-        best_val_exact = init_metrics["exact"]
-        best_val_loss = init_metrics["loss"]
-        print(
-            f"stage=rollout_eval_init R={args.val_R} K={args.val_K} val_exact={init_metrics['exact']:.4f} val_cell={init_metrics['cell']:.4f} val_q={init_metrics['q']:.4f}"
-        )
+        if is_rank_zero():
+            init_metrics = evaluate_with_optional_ema(
+                evaluate_reasoner, model, args, device, val_group_ids, ema
+            )
+            best_val_exact = init_metrics["exact"]
+            best_val_loss = init_metrics["loss"]
+            tqdm.write(
+                f"stage=rollout_eval_init R={args.val_R} K={args.val_K} val_exact={init_metrics['exact']:.4f} val_cell={init_metrics['cell']:.4f} val_q={init_metrics['q']:.4f}"
+            )
+        ddp_barrier()
 
     rollout_epoch_target = (
         args.rollout_epochs
         if args.rollout_epochs > 0
         else total_steps * args.rollout_batch_size / train_group_count
     )
-    print(
-        f"stage=rollout total_steps={total_steps} epochs={rollout_epoch_target:g} R_train={args.rollout_R} sampling={args.sampling} train_groups={train_group_count}"
+    rank_print(
+        f"stage=rollout total_steps={total_steps} epochs={rollout_epoch_target:g} R_train={args.rollout_R} sampling={args.sampling} batch_size={args.rollout_batch_size} local_batch_size={rollout_batch_size} train_groups={train_group_count}"
     )
-    progress = tqdm(range(1, total_steps + 1), desc="rollout", total=total_steps)
+    progress = tqdm(
+        range(1, total_steps + 1),
+        desc="rollout",
+        total=total_steps,
+        disable=not is_rank_zero(),
+    )
     for step in progress:
         if args.sampling == "group":
             epoch_done, raw = next(group_iter)
@@ -851,8 +952,8 @@ def train_rollout(
         rollout_loss = answer_ce(
             logits,
             batch.solution_classes,
-            unwrap_data_parallel(model.vae).config.output_vocab_size,
-            unwrap_data_parallel(model.vae).config.ignore_index,
+            unwrap_parallel(model.vae).config.output_vocab_size,
+            unwrap_parallel(model.vae).config.ignore_index,
             args.answer_label_smoothing,
             args.stablemax,
         )
@@ -865,8 +966,8 @@ def train_rollout(
                         answer_ce(
                             mid,
                             batch.solution_classes,
-                            unwrap_data_parallel(model.vae).config.output_vocab_size,
-                            unwrap_data_parallel(model.vae).config.ignore_index,
+                            unwrap_parallel(model.vae).config.output_vocab_size,
+                            unwrap_parallel(model.vae).config.ignore_index,
                             args.answer_label_smoothing,
                             args.stablemax,
                         )
@@ -898,9 +999,9 @@ def train_rollout(
         set_warmup_lr(opt, args.rollout_lr, step, args.rollout_warmup_steps)
         opt.step()
         if ema is not None:
-            ema.update(model.reasoner)
+            ema.update(unwrap_parallel(model.reasoner))
 
-        if step == 1 or step % 100 == 0:
+        if is_rank_zero() and (step == 1 or step % 100 == 0):
             exact, cell = exact_and_cell_accuracy(pred_tokens, batch.solution_tokens)
             progress.set_postfix(
                 epoch=f"{epoch_done:.1f}/{rollout_epoch_target:g}",
@@ -914,40 +1015,44 @@ def train_rollout(
         if val_group_ids.size and (
             step == 1 or step % eval_interval_steps == 0 or step == total_steps
         ):
-            metrics = evaluate_with_optional_ema(
-                evaluate_reasoner, model, args, device, val_group_ids, ema
-            )
-            tqdm.write(
-                f"stage=rollout_eval step={step} epoch={epoch_done:.2f} R={args.val_R} K={args.val_K} val_exact={metrics['exact']:.4f} val_cell={metrics['cell']:.4f} val_q={metrics['q']:.4f}"
-            )
-            is_better = (metrics["exact"] > best_val_exact) or (
-                metrics["exact"] == best_val_exact and metrics["loss"] < best_val_loss
-            )
-            if is_better:
-                best_val_exact = metrics["exact"]
-                best_val_loss = metrics["loss"]
-                save_with_optional_ema(
-                    save_unified,
-                    best_unified_out,
-                    model,
-                    {
-                        "stage": "rollout",
-                        "rollout_steps": step,
-                        "rollout_epoch": epoch_done,
-                        "rollout_R": args.rollout_R,
-                        "selection": "max_rollout_exact",
-                        "val_metrics": metrics,
-                    },
-                    ema,
+            if is_rank_zero():
+                metrics = evaluate_with_optional_ema(
+                    evaluate_reasoner, model, args, device, val_group_ids, ema
                 )
-                tqdm.write(f"saved best unified {best_unified_out}")
+                tqdm.write(
+                    f"stage=rollout_eval step={step} epoch={epoch_done:.2f} R={args.val_R} K={args.val_K} val_exact={metrics['exact']:.4f} val_cell={metrics['cell']:.4f} val_q={metrics['q']:.4f}"
+                )
+                is_better = (metrics["exact"] > best_val_exact) or (
+                    metrics["exact"] == best_val_exact
+                    and metrics["loss"] < best_val_loss
+                )
+                if is_better:
+                    best_val_exact = metrics["exact"]
+                    best_val_loss = metrics["loss"]
+                    save_with_optional_ema(
+                        save_unified,
+                        best_unified_out,
+                        model,
+                        {
+                            "stage": "rollout",
+                            "rollout_steps": step,
+                            "rollout_epoch": epoch_done,
+                            "rollout_R": args.rollout_R,
+                            "selection": "max_rollout_exact",
+                            "val_metrics": metrics,
+                        },
+                        ema,
+                    )
+                    tqdm.write(f"saved best unified {best_unified_out}")
+            ddp_barrier()
     return total_steps
 
 
 def main() -> None:
     args = parse_args()
+    init_distributed(args)
+    device = resolve_device(args)
     configure_output_paths(args)
-    device, gpu_ids = resolve_device(args)
     train_group_ids, val_group_ids = split_group_ids(
         args.data_dir,
         args.task,
@@ -955,17 +1060,19 @@ def main() -> None:
         seed=args.seed,
         limit_groups=args.train_limit if args.sampling == "group" else None,
     )
-    print(
-        f"groups train={train_group_ids.size} val={val_group_ids.size} sampling={args.sampling}"
+    rank_print(
+        f"groups train={train_group_ids.size} val={val_group_ids.size} sampling={args.sampling} ddp={args.ddp} world_size={get_world_size()}"
     )
-    vae = train_vae(args, device, train_group_ids, val_group_ids, gpu_ids)
+    vae = train_vae(args, device, train_group_ids, val_group_ids)
+    ddp_barrier()
     best_vae_out = best_path(args.vae_out) if args.vae_out is not None else None
     if best_vae_out is not None and Path(best_vae_out).exists():
         vae, best_vae_ckpt = load_vae(best_vae_out, device)
-        print(f"loaded best VAE for stats/reasoner from {best_vae_out}")
-    if args.vae_out is not None:
+        rank_print(f"loaded best VAE for stats/reasoner from {best_vae_out}")
+    if args.vae_out is not None and is_rank_zero():
         save_vae(args.vae_out, vae, {"steps": args.vae_max_steps})
-        print(f"saved {Path(args.vae_out)}")
+        rank_print(f"saved {Path(args.vae_out)}")
+    ddp_barrier()
     mean, std, stats_count = compute_latent_stats(args, device, vae, train_group_ids)
     reasoner = LatentFlowReasoner(
         ReasonerConfig(
@@ -982,18 +1089,19 @@ def main() -> None:
         )
     ).to(device)
     unified = UnifiedLatentReasoner(vae, reasoner, task=args.task).to(device)
-    unified.reasoner = maybe_data_parallel(unified.reasoner, gpu_ids, "reasoner")
+    unified.reasoner = maybe_ddp(unified.reasoner, args, "reasoner")
     unified.set_latent_stats(mean, std)
-    ema = make_ema(unified.reasoner, args.ema_decay)
+    ema = make_ema(unwrap_parallel(unified.reasoner), args.ema_decay)
     if ema is not None:
-        print(f"reasoner_ema decay={ema.decay}")
+        rank_print(f"reasoner_ema decay={ema.decay}")
     param_counts = {
         "vae": parameter_counts(vae),
-        "reasoner": parameter_counts(unwrap_data_parallel(reasoner)),
+        "reasoner": parameter_counts(reasoner),
         "unified": parameter_counts(unified),
     }
-    update_config_json(args, {"parameter_counts": param_counts})
-    print(
+    if is_rank_zero():
+        update_config_json(args, {"parameter_counts": param_counts})
+    rank_print(
         "parameters "
         f"vae={param_counts['vae']['total']} "
         f"reasoner={param_counts['reasoner']['total']} "
@@ -1024,11 +1132,18 @@ def main() -> None:
             "train_groups": int(train_group_ids.size),
             "val_groups": int(val_group_ids.size),
             "latent_stats_count": stats_count,
+            "ddp": bool(args.ddp),
+            "world_size": get_world_size(),
+            "ddp_batch_size_mode": args.ddp_batch_size_mode,
         },
         ema,
     )
-    print(f"saved {Path(args.out)}")
+    ddp_barrier()
+    rank_print(f"saved {Path(args.out)}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_distributed()
