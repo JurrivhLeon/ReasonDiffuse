@@ -198,7 +198,7 @@ def parse_args() -> argparse.Namespace:
         "--rollout-curriculum",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Start rollout training from a scheduled teacher-forced state and use grid FM loss.",
+        help="Start rollout training from a scheduled teacher-forced state; FM loss samples one full-interval time per example.",
     )
     p.add_argument(
         "--rollout-curriculum-tau-start",
@@ -881,23 +881,6 @@ def rollout_curriculum_data_tau(
     return start + half_progress * (end - start)
 
 
-def fm_grid_loss(
-    model: UnifiedLatentReasoner,
-    batch,
-    z_star: torch.Tensor,
-    eps: torch.Tensor,
-    r_steps: int,
-) -> torch.Tensor:
-    target_v = eps - z_star
-    losses = []
-    for tau_value in torch.linspace(1.0, 0.0, r_steps + 1, device=z_star.device):
-        tau = torch.full((z_star.shape[0],), tau_value.item(), device=z_star.device)
-        z_tau = (1.0 - tau[:, None, None]) * z_star + tau[:, None, None] * eps
-        out = model.reasoner_step(z_tau, batch.puzzle_tokens, tau)
-        losses.append(F.mse_loss(out["velocity"], target_v))
-    return torch.stack(losses).mean()
-
-
 def curriculum_rollout_start(
     args: argparse.Namespace,
     step: int,
@@ -1031,8 +1014,13 @@ def train_rollout(
             )
 
         eps = torch.randn_like(z_star)
+        tau = torch.rand(z_star.shape[0], device=device)
+        z_tau = (1.0 - tau[:, None, None]) * z_star + tau[:, None, None] * eps
+        target_v = eps - z_star
+        tf_out = model.reasoner_step(z_tau, batch.puzzle_tokens, tau)
+        fm_loss = F.mse_loss(tf_out["velocity"], target_v)
+
         if args.rollout_curriculum:
-            fm_loss = fm_grid_loss(model, batch, z_star, eps, args.rollout_R)
             z_start, tau_start, active_steps, data_tau_start = curriculum_rollout_start(
                 args, step, total_steps, args.rollout_R, z_star, eps
             )
@@ -1044,11 +1032,6 @@ def train_rollout(
                 tau_start=tau_start,
             )
         else:
-            tau = torch.rand(z_star.shape[0], device=device)
-            z_tau = (1.0 - tau[:, None, None]) * z_star + tau[:, None, None] * eps
-            target_v = eps - z_star
-            tf_out = model.reasoner_step(z_tau, batch.puzzle_tokens, tau)
-            fm_loss = F.mse_loss(tf_out["velocity"], target_v)
             active_steps = args.rollout_R
             data_tau_start = 0.0
             roll_out = model.rollout(
